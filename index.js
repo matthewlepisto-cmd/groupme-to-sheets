@@ -4,7 +4,8 @@ import { google } from "googleapis";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID || "1xT7jHcFOVIkkcljwtyDj9NlNIP8S7pn9qVNDna7wuEw";
+const SPREADSHEET_ID =
+  process.env.SPREADSHEET_ID || "1xT7jHcFOVIkkcljwtyDj9NlNIP8S7pn9qVNDna7wuEw";
 const SHEET_NAME = process.env.SHEET_NAME || "Import";
 const GOOGLE_CREDS_JSON = process.env.GOOGLE_CREDS_JSON;
 const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || "0cb4eb2388c240e337b026610a";
@@ -38,8 +39,6 @@ app.get("/", (req, res) => res.status(200).send("OK"));
 
 async function buildLeaderboardMessage() {
   const sheets = getSheetsClient();
-
-  // Name (A) + Points (B), rows 1-27
   const range = `Leaderboard!A1:B27`;
 
   const resp = await sheets.spreadsheets.values.get({
@@ -50,28 +49,41 @@ async function buildLeaderboardMessage() {
   const values = resp.data.values || [];
   if (values.length < 2) return "Leaderboard is empty.";
 
-  // Assume first row is headers: ["Name","Points"]
   const rows = values.slice(1);
 
-  // Format nicely
   const lines = rows
-    .filter(r => (r[0] ?? "").toString().trim() !== "")
+    .filter((r) => (r[0] ?? "").toString().trim() !== "")
     .map((r, i) => {
       const name = (r[0] ?? "").toString().trim();
       const pts = (r[1] ?? "").toString().trim();
       return `${String(i + 1).padStart(2, " ")}. ${name} — ${pts}`;
     });
 
-  const header = "🏁 Leaderboard (Top 26)\n";
-  return header + lines.join("\n");
+  return "🏁 Leaderboard\n" + lines.join("\n");
+}
+
+function chunkText(text, maxLen) {
+  if (!text || text.length <= maxLen) return [text];
+
+  const chunks = [];
+  let start = 0;
+
+  while (start < text.length) {
+    let end = Math.min(start + maxLen, text.length);
+
+    const lastNl = text.lastIndexOf("\n", end);
+    if (lastNl > start + 50) end = lastNl;
+
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+  return chunks;
 }
 
 async function postToGroupMe(text) {
-  const url = "https://api.groupme.com/v3/bots/post"; // GroupMe bot post endpoint :contentReference[oaicite:1]{index=1}
+  const url = "https://api.groupme.com/v3/bots/post";
 
-  // GroupMe messages have a size limit; keep chunks under ~900 chars
   const chunks = chunkText(text, 900);
-
   for (const chunk of chunks) {
     const res = await fetch(url, {
       method: "POST",
@@ -86,51 +98,29 @@ async function postToGroupMe(text) {
   }
 }
 
-function chunkText(text, maxLen) {
-  if (!text || text.length <= maxLen) return [text];
-
-  const chunks = [];
-  let start = 0;
-
-  while (start < text.length) {
-    let end = Math.min(start + maxLen, text.length);
-
-    // Prefer splitting on newline
-    const lastNl = text.lastIndexOf("\n", end);
-    if (lastNl > start + 50) end = lastNl;
-
-    chunks.push(text.slice(start, end));
-    start = end;
-  }
-  return chunks;
-}
-
-
 app.post("/groupme", async (req, res) => {
   const msg = req.body;
 
   try {
     if (!msg) return res.sendStatus(200);
 
-    // Prevent loops + avoid bot chatter
+    // Ignore bot messages to prevent loops
     if (msg.sender_type === "bot") return res.sendStatus(200);
     if (GROUPME_BOT_ID && msg.sender_id === GROUPME_BOT_ID) return res.sendStatus(200);
-    // Ignore bot messages
+
     const text = msg.text?.trim();
-    if (!text || !text.includes("#")) {
+
+    // Respond to "Board Update"
+    if (text && text.toLowerCase() === "board update") {
+      const board = await buildLeaderboardMessage();
+      await postToGroupMe(board);
       return res.sendStatus(200);
     }
 
-// Trigger: Board Update (case-insensitive)
-if (text && text.toLowerCase() === "board update") {
-  const board = await buildLeaderboardMessage();
-  await postToGroupMe(board);
-  return res.sendStatus(200);
-}
-    
-    const hasText = typeof msg.text === "string" && msg.text.length > 0;
+    // Only import messages that contain #
+    if (!text || !text.includes("#")) return res.sendStatus(200);
+
     const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-    if (!hasText && !hasAttachments) return res.sendStatus(200);
 
     const timestampIso = msg.created_at
       ? new Date(msg.created_at * 1000).toISOString()
@@ -138,28 +128,23 @@ if (text && text.toLowerCase() === "board update") {
 
     const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
 
-    // Columns: timestamp | group_id | sender_id | sender_name | text | attachments | message_id
     const row = [
       timestampIso,
       msg.group_id || "",
       msg.sender_id || "",
       msg.name || "",
-      msg.text || "",
+      text || "",              // ✅ trimmed text saved
       attachmentsJson,
-      msg.id || ""
+      msg.id || "",
     ];
 
     await appendRow(row);
     return res.sendStatus(200);
   } catch (err) {
     console.error("Webhook error:", err);
-    // Return 200 to stop GroupMe retries; rely on logs to diagnose
     return res.sendStatus(200);
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
-
-
-
