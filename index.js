@@ -143,6 +143,13 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
+ // Respond to "wins"
+    if (text && text.toLowerCase() === "wins") {
+      const winsMsg = await buildWinsMessage();
+      await postToGroupMe(winsMsg);
+      return res.sendStatus(200);
+    }
+    
     // Only import messages that contain #
     if (!text || !text.includes("#")) return res.sendStatus(200);
 
@@ -174,4 +181,5 @@ app.post("/groupme", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
 
