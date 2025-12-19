@@ -45,7 +45,12 @@ app.post("/groupme", async (req, res) => {
     // Prevent loops + avoid bot chatter
     if (msg.sender_type === "bot") return res.sendStatus(200);
     if (GROUPME_BOT_ID && msg.sender_id === GROUPME_BOT_ID) return res.sendStatus(200);
-
+    // Ignore bot messages
+    const text = msg.text?.trim();
+    if (!text || !text.includes("#")) {
+      return res.sendStatus(200);
+    }
+    
     const hasText = typeof msg.text === "string" && msg.text.length > 0;
     const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
     if (!hasText && !hasAttachments) return res.sendStatus(200);
@@ -78,3 +83,4 @@ app.post("/groupme", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
