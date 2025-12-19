@@ -36,6 +36,71 @@ async function appendRow(row) {
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
+// Read a range from the Leaderboard tab and turn it into a GroupMe-friendly message
+async function buildLeaderboardMessage() {
+  const sheets = getSheetsClient();
+
+  // Adjust range to what you want to display
+  // Example: A1:D21 shows header + top 20 rows
+  const range = `Leaderboard!A1:D21`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
+  const values = resp.data.values || [];
+  if (!values.length) return "Leaderboard tab is empty.";
+
+  // Simple formatting: rows joined by " | "
+  const lines = values.map((row) => row.map((c) => String(c ?? "")).join(" | "));
+  return `🏁 Leaderboard\n` + lines.join("\n");
+}
+
+// Post a message back to GroupMe as your bot
+async function postToGroupMe(text) {
+  // GroupMe bot post endpoint
+  // Docs: POST /bots/post with bot_id and text :contentReference[oaicite:1]{index=1}
+  const url = "https://api.groupme.com/v3/bots/post";
+
+  // GroupMe messages have a max length; to be safe, chunk around 900 chars.
+  const chunks = chunkText(text, 900);
+
+  for (const chunk of chunks) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bot_id: GROUPME_BOT_ID, text: chunk }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error("GroupMe post failed:", res.status, body);
+    }
+  }
+}
+
+function chunkText(text, maxLen) {
+  if (!text || text.length <= maxLen) return [text];
+
+  const chunks = [];
+  let start = 0;
+
+  while (start < text.length) {
+    let end = Math.min(start + maxLen, text.length);
+
+    // Try to split on newline for nicer chunks
+    const lastNl = text.lastIndexOf("\n", end);
+    if (lastNl > start + 50) end = lastNl;
+
+    chunks.push(text.slice(start, end));
+    start = end;
+  }
+
+  return chunks;
+}
+
+
 app.post("/groupme", async (req, res) => {
   const msg = req.body;
 
@@ -50,6 +115,13 @@ app.post("/groupme", async (req, res) => {
     if (!text || !text.includes("#")) {
       return res.sendStatus(200);
     }
+
+// Trigger: Board Update (case-insensitive)
+if (text && text.toLowerCase() === "board update") {
+  const board = await buildLeaderboardMessage();
+  await postToGroupMe(board);
+  return res.sendStatus(200);
+}
     
     const hasText = typeof msg.text === "string" && msg.text.length > 0;
     const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
@@ -83,4 +155,5 @@ app.post("/groupme", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
 
