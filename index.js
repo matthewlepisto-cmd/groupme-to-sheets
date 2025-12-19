@@ -37,6 +37,32 @@ async function appendRow(row) {
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
+async function buildWinsMessage() {
+  const sheets = getSheetsClient();
+  const range = `WINS!A1:B27`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
+  const values = resp.data.values || [];
+  if (values.length < 2) return "WINS tab is empty.";
+
+  const rows = values.slice(1); // skip headers
+
+  const lines = rows
+    .filter((r) => (r[0] ?? "").toString().trim() !== "")
+    .map((r, i) => {
+      const name = (r[0] ?? "").toString().trim();
+      const wins = (r[1] ?? "").toString().trim();
+      return `${String(i + 1).padStart(2, " ")}. ${name} — ${wins}`;
+    });
+
+  return "🏆 Wins\n" + lines.join("\n");
+}
+
+
 async function buildLeaderboardMessage() {
   const sheets = getSheetsClient();
   const range = `Leaderboard!A1:B27`;
@@ -148,3 +174,4 @@ app.post("/groupme", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
