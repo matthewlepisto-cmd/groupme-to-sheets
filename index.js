@@ -36,13 +36,11 @@ async function appendRow(row) {
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-// Read a range from the Leaderboard tab and turn it into a GroupMe-friendly message
 async function buildLeaderboardMessage() {
   const sheets = getSheetsClient();
 
-  // Adjust range to what you want to display
-  // Example: A1:D21 shows header + top 20 rows
-  const range = `Leaderboard!A1:D21`;
+  // Name (A) + Points (B), rows 1-27
+  const range = `Leaderboard!A1:B27`;
 
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -50,20 +48,28 @@ async function buildLeaderboardMessage() {
   });
 
   const values = resp.data.values || [];
-  if (!values.length) return "Leaderboard tab is empty.";
+  if (values.length < 2) return "Leaderboard is empty.";
 
-  // Simple formatting: rows joined by " | "
-  const lines = values.map((row) => row.map((c) => String(c ?? "")).join(" | "));
-  return `🏁 Leaderboard\n` + lines.join("\n");
+  // Assume first row is headers: ["Name","Points"]
+  const rows = values.slice(1);
+
+  // Format nicely
+  const lines = rows
+    .filter(r => (r[0] ?? "").toString().trim() !== "")
+    .map((r, i) => {
+      const name = (r[0] ?? "").toString().trim();
+      const pts = (r[1] ?? "").toString().trim();
+      return `${String(i + 1).padStart(2, " ")}. ${name} — ${pts}`;
+    });
+
+  const header = "🏁 Leaderboard (Top 26)\n";
+  return header + lines.join("\n");
 }
 
-// Post a message back to GroupMe as your bot
 async function postToGroupMe(text) {
-  // GroupMe bot post endpoint
-  // Docs: POST /bots/post with bot_id and text :contentReference[oaicite:1]{index=1}
-  const url = "https://api.groupme.com/v3/bots/post";
+  const url = "https://api.groupme.com/v3/bots/post"; // GroupMe bot post endpoint :contentReference[oaicite:1]{index=1}
 
-  // GroupMe messages have a max length; to be safe, chunk around 900 chars.
+  // GroupMe messages have a size limit; keep chunks under ~900 chars
   const chunks = chunkText(text, 900);
 
   for (const chunk of chunks) {
@@ -89,14 +95,13 @@ function chunkText(text, maxLen) {
   while (start < text.length) {
     let end = Math.min(start + maxLen, text.length);
 
-    // Try to split on newline for nicer chunks
+    // Prefer splitting on newline
     const lastNl = text.lastIndexOf("\n", end);
     if (lastNl > start + 50) end = lastNl;
 
     chunks.push(text.slice(start, end));
     start = end;
   }
-
   return chunks;
 }
 
@@ -155,5 +160,6 @@ if (text && text.toLowerCase() === "board update") {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
 
 
