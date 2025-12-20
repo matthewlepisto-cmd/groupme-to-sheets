@@ -37,6 +37,66 @@ async function appendRow(row) {
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
+/**
+ * Reads Driver Count tab layout:
+ * - Row 1: names repeated across multiple columns
+ * - Row 3: labels for those columns ("Driver" or "Count")
+ * - Data rows (row 4+): driver token like "#2" under the sender's Driver column
+ *   and the corresponding count under the sender's Count column (same row).
+ */
+async function getDriverCountForPick(senderName, pickToken) {
+  const sheets = getSheetsClient();
+
+  // Adjust the range if your sheet is larger
+  const range = `Driver Count!A1:ZZ2000`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
+  const values = resp.data.values || [];
+  if (values.length < 4) return null;
+
+  const row1 = values[0] || []; // names
+  const row3 = values[2] || []; // "Driver" / "Count"
+
+  const norm = (v) => (v ?? "").toString().trim();
+  const normLower = (v) => norm(v).toLowerCase();
+
+  const sender = norm(senderName);
+  if (!sender) return null;
+
+  let driverCol = -1;
+  let countCol = -1;
+
+  // Find the sender's Driver column and Count column
+  for (let c = 0; c < Math.max(row1.length, row3.length); c++) {
+    const nameAtC = norm(row1[c]);
+    if (nameAtC !== sender) continue;
+
+    const label = normLower(row3[c]);
+    if (label === "driver") driverCol = c;
+    if (label === "count") countCol = c;
+  }
+
+  if (driverCol === -1 || countCol === -1) return null;
+
+  const pick = norm(pickToken);
+
+  // Data begins at sheet row 4 -> index 3
+  for (let r = 3; r < values.length; r++) {
+    const row = values[r] || [];
+    const driverVal = norm(row[driverCol]);
+    if (driverVal === pick) {
+      const countVal = norm(row[countCol]);
+      return countVal || null;
+    }
+  }
+
+  return null;
+}
+
 async function buildWinsMessage() {
   const sheets = getSheetsClient();
   const range = `WINS!A1:B27`;
@@ -62,7 +122,6 @@ async function buildWinsMessage() {
   return "🏆 Wins\n" + lines.join("\n");
 }
 
-
 async function buildLeaderboardMessage() {
   const sheets = getSheetsClient();
   const range = `Leaderboard!A1:B27`;
@@ -75,7 +134,7 @@ async function buildLeaderboardMessage() {
   const values = resp.data.values || [];
   if (values.length < 2) return "Leaderboard is empty.";
 
-  const rows = values.slice(1);
+  const rows = values.slice(1); // skip headers
 
   const lines = rows
     .filter((r) => (r[0] ?? "").toString().trim() !== "")
@@ -97,6 +156,7 @@ function chunkText(text, maxLen) {
   while (start < text.length) {
     let end = Math.min(start + maxLen, text.length);
 
+    // Prefer splitting on newline for nicer chunks
     const lastNl = text.lastIndexOf("\n", end);
     if (lastNl > start + 50) end = lastNl;
 
@@ -143,22 +203,35 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
- // Respond to "wins"
+    // Respond to "wins"
     if (text && text.toLowerCase() === "wins") {
       const winsMsg = await buildWinsMessage();
       await postToGroupMe(winsMsg);
       return res.sendStatus(200);
     }
-    
-    // Only import messages that contain #
+
+    // Only handle/import messages that contain #
     if (!text || !text.includes("#")) return res.sendStatus(200);
 
-    const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
+    // Extract first hashtag token (e.g., "#2") from the message
+    const pickToken = (text.match(/#[^\s]+/) || [text])[0];
 
+    // Look up driver count from "Driver Count" sheet
+    const senderName = msg.name || "";
+    const driverCount = await getDriverCountForPick(senderName, pickToken);
+
+    // Respond back to GroupMe
+    if (driverCount !== null && driverCount !== undefined && driverCount !== "") {
+      await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`);
+    } else {
+      await postToGroupMe(`Pick Submitted, ${pickToken} - ?`);
+    }
+
+    // Append to Import tab
+    const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
     const timestampIso = msg.created_at
       ? new Date(msg.created_at * 1000).toISOString()
       : new Date().toISOString();
-
     const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
 
     const row = [
@@ -166,7 +239,7 @@ app.post("/groupme", async (req, res) => {
       msg.group_id || "",
       msg.sender_id || "",
       msg.name || "",
-      text || "",              // ✅ trimmed text saved
+      text || "",
       attachmentsJson,
       msg.id || "",
     ];
@@ -181,5 +254,3 @@ app.post("/groupme", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
-
-
