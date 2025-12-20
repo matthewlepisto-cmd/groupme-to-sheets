@@ -210,6 +210,97 @@ async function postToGroupMe(text) {
   }
 }
 
+const SCHEDULE_SHEET = process.env.SCHEDULE_SHEET || "Schedule";
+const SCHEDULE_POLL_MS = Number(process.env.SCHEDULE_POLL_MS || 60_000); // 1 min
+const SCHEDULE_LOOKAHEAD_MS = Number(process.env.SCHEDULE_LOOKAHEAD_MS || 2 * 60_000); // 2 min
+
+function toIso(dt) {
+  return dt ? new Date(dt).toISOString() : new Date().toISOString();
+}
+
+/**
+ * Reads scheduled messages and returns rows that are due.
+ * Assumes columns:
+ * A: SendAt (datetime)
+ * B: Message
+ * C: Sent (YES/blank)
+ * D: SentAt
+ */
+async function getDueScheduledMessages(now = new Date()) {
+  const sheets = getSheetsClient();
+  const range = `${SCHEDULE_SHEET}!A2:D`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
+  const values = resp.data.values || [];
+  const due = [];
+
+  // We treat "due" as: sendAt <= now and within lookahead window to be resilient
+  const nowMs = now.getTime();
+  const windowStart = nowMs - SCHEDULE_LOOKAHEAD_MS;
+
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i] || [];
+    const sendAtRaw = row[0];
+    const message = (row[1] ?? "").toString();
+    const sent = (row[2] ?? "").toString().trim().toUpperCase();
+
+    if (!sendAtRaw || !message) continue;
+    if (sent === "YES") continue;
+
+    // Google Sheets API returns datetimes as strings unless you use valueRenderOption.
+    // We'll parse permissively.
+    const sendAt = new Date(sendAtRaw);
+    if (isNaN(sendAt.getTime())) continue;
+
+    const sendAtMs = sendAt.getTime();
+
+    if (sendAtMs <= nowMs && sendAtMs >= windowStart) {
+      // rowIndex in sheet is i + 2 because range starts at A2
+      due.push({
+        rowIndex: i + 2,
+        message,
+        sendAt,
+      });
+    }
+  }
+
+  return due;
+}
+
+async function markScheduledMessageSent(rowIndex, sentAt = new Date()) {
+  const sheets = getSheetsClient();
+
+  // Write "YES" to column C and ISO timestamp to column D
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SCHEDULE_SHEET}!C${rowIndex}:D${rowIndex}`,
+    valueInputOption: "RAW",
+    requestBody: { values: [["YES", toIso(sentAt)]] },
+  });
+}
+
+/**
+ * Polls schedule sheet, sends any due messages, and marks them sent.
+ */
+async function runScheduleTick() {
+  try {
+    const due = await getDueScheduledMessages(new Date());
+    if (!due.length) return;
+
+    for (const item of due) {
+      await postToGroupMe(item.message);
+      await markScheduledMessageSent(item.rowIndex, new Date());
+    }
+  } catch (err) {
+    console.error("Schedule tick error:", err);
+  }
+}
+
+
 app.post("/groupme", async (req, res) => {
   const msg = req.body;
 
@@ -286,7 +377,17 @@ if (text && text.toLowerCase() === "crown jewel") {
   }
 });
 
+// Kick off schedule polling
+setInterval(() => {
+  runScheduleTick();
+}, SCHEDULE_POLL_MS);
+
+// Optional: run once at startup
+runScheduleTick().catch(() => {});
+
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
 
 
