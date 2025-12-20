@@ -122,6 +122,32 @@ async function buildWinsMessage() {
   return "🏆 Wins\n" + lines.join("\n");
 }
 
+async function buildCrownJewelMessage() {
+  const sheets = getSheetsClient();
+
+  // Name (A) + Points (B), rows 11–37
+  const range = `Crown Jewel!A11:B37`;
+
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
+  const values = resp.data.values || [];
+  if (!values.length) return "Crown Jewel tab is empty.";
+
+  const lines = values
+    .filter((r) => (r[0] ?? "").toString().trim() !== "")
+    .map((r, i) => {
+      const name = (r[0] ?? "").toString().trim();
+      const pts = (r[1] ?? "").toString().trim();
+      return `${String(i + 1).padStart(2, " ")}. ${name} — ${pts}`;
+    });
+
+  return "👑 Crown Jewel Standings\n" + lines.join("\n");
+}
+
+
 async function buildLeaderboardMessage() {
   const sheets = getSheetsClient();
   const range = `Leaderboard!A1:B27`;
@@ -203,6 +229,14 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
+// Respond to "Crown Jewel"
+if (text && text.toLowerCase() === "crown jewel") {
+  const crownMsg = await buildCrownJewelMessage();
+  await postToGroupMe(crownMsg);
+  return res.sendStatus(200);
+}
+
+    
     // Respond to "wins"
     if (text && text.toLowerCase() === "wins") {
       const winsMsg = await buildWinsMessage();
@@ -254,3 +288,4 @@ app.post("/groupme", async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
