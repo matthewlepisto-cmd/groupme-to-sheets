@@ -24,6 +24,16 @@ function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
+if (text && text.toLowerCase() === "run results") {
+  await fetch(process.env.APPS_SCRIPT_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: "run_results" }),
+  });
+
+  await postToGroupMe("🏁 Results import started…");
+  return res.sendStatus(200);
+}
 
 
 async function appendRow(row) {
@@ -390,6 +400,7 @@ runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
 
 
 
