@@ -125,8 +125,8 @@ async function buildWinsMessage() {
 async function buildCrownJewelMessage() {
   const sheets = getSheetsClient();
 
-  // Name (A) + Points (B), rows 11–37
-  const range = `Crown Jewel!A11:B37`;
+  // Name (A) + Points (B), rows 12–37
+  const range = `Crown Jewel!A12:B37`;
 
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -288,4 +288,5 @@ if (text && text.toLowerCase() === "crown jewel") {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
 
