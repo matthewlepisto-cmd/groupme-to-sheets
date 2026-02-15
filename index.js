@@ -8,7 +8,15 @@ const SPREADSHEET_ID =
   process.env.SPREADSHEET_ID || "1xT7jHcFOVIkkcljwtyDj9NlNIP8S7pn9qVNDna7wuEw";
 const SHEET_NAME = process.env.SHEET_NAME || "Import";
 const GOOGLE_CREDS_JSON = process.env.GOOGLE_CREDS_JSON;
-const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || "0cb4eb2388c240e337b026610a";
+
+// MAIN bot (posts to main group)
+const GROUPME_BOT_ID =
+  process.env.GROUPME_BOT_ID || "08d51442da9b9a749a7e6bd04d";
+
+// COMMAND bot (admin group only)
+const COMMAND_GROUP_ID = "110916855";
+const COMMAND_BOT_ID = "0cb4eb2388c240e337b026610a";
+
 
 if (!SPREADSHEET_ID || !GOOGLE_CREDS_JSON) {
   console.error("Missing env vars: SPREADSHEET_ID and/or GOOGLE_CREDS_JSON");
@@ -24,8 +32,6 @@ function getSheetsClient() {
   return google.sheets({ version: "v4", auth });
 }
 
-
-
 async function appendRow(row) {
   const sheets = getSheetsClient();
   await sheets.spreadsheets.values.append({
@@ -39,17 +45,8 @@ async function appendRow(row) {
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-/**
- * Reads Driver Count tab layout:
- * - Row 1: names repeated across multiple columns
- * - Row 3: labels for those columns ("Driver" or "Count")
- * - Data rows (row 4+): driver token like "#2" under the sender's Driver column
- *   and the corresponding count under the sender's Count column (same row).
- */
 async function getDriverCountForPick(senderName, pickToken) {
   const sheets = getSheetsClient();
-
-  // Adjust the range if your sheet is larger
   const range = `Driver Count!A1:ZZ2000`;
 
   const resp = await sheets.spreadsheets.values.get({
@@ -60,8 +57,8 @@ async function getDriverCountForPick(senderName, pickToken) {
   const values = resp.data.values || [];
   if (values.length < 4) return null;
 
-  const row1 = values[0] || []; // names
-  const row3 = values[2] || []; // "Driver" / "Count"
+  const row1 = values[0] || [];
+  const row3 = values[2] || [];
 
   const norm = (v) => (v ?? "").toString().trim();
   const normLower = (v) => norm(v).toLowerCase();
@@ -72,7 +69,6 @@ async function getDriverCountForPick(senderName, pickToken) {
   let driverCol = -1;
   let countCol = -1;
 
-  // Find the sender's Driver column and Count column
   for (let c = 0; c < Math.max(row1.length, row3.length); c++) {
     const nameAtC = norm(row1[c]);
     if (nameAtC !== sender) continue;
@@ -86,7 +82,6 @@ async function getDriverCountForPick(senderName, pickToken) {
 
   const pick = norm(pickToken);
 
-  // Data begins at sheet row 4 -> index 3
   for (let r = 3; r < values.length; r++) {
     const row = values[r] || [];
     const driverVal = norm(row[driverCol]);
@@ -111,7 +106,7 @@ async function buildWinsMessage() {
   const values = resp.data.values || [];
   if (values.length < 2) return "WINS tab is empty.";
 
-  const rows = values.slice(1); // skip headers
+  const rows = values.slice(1);
 
   const lines = rows
     .filter((r) => (r[0] ?? "").toString().trim() !== "")
@@ -126,8 +121,6 @@ async function buildWinsMessage() {
 
 async function buildCrownJewelMessage() {
   const sheets = getSheetsClient();
-
-  // Name (A) + Points (B), rows 12–37
   const range = `Crown Jewel!A12:B37`;
 
   const resp = await sheets.spreadsheets.values.get({
@@ -149,7 +142,6 @@ async function buildCrownJewelMessage() {
   return "👑 Crown Jewel Standings\n" + lines.join("\n");
 }
 
-
 async function buildLeaderboardMessage() {
   const sheets = getSheetsClient();
   const range = `Leaderboard!A1:B27`;
@@ -162,7 +154,7 @@ async function buildLeaderboardMessage() {
   const values = resp.data.values || [];
   if (values.length < 2) return "Leaderboard is empty.";
 
-  const rows = values.slice(1); // skip headers
+  const rows = values.slice(1);
 
   const lines = rows
     .filter((r) => (r[0] ?? "").toString().trim() !== "")
@@ -183,8 +175,6 @@ function chunkText(text, maxLen) {
 
   while (start < text.length) {
     let end = Math.min(start + maxLen, text.length);
-
-    // Prefer splitting on newline for nicer chunks
     const lastNl = text.lastIndexOf("\n", end);
     if (lastNl > start + 50) end = lastNl;
 
@@ -194,7 +184,8 @@ function chunkText(text, maxLen) {
   return chunks;
 }
 
-async function postToGroupMe(text) {
+// ✅ UPDATED: post to a specific bot_id (main or command)
+async function postToGroupMe(text, botId = GROUPME_BOT_ID) {
   const url = "https://api.groupme.com/v3/bots/post";
 
   const chunks = chunkText(text, 900);
@@ -202,7 +193,7 @@ async function postToGroupMe(text) {
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bot_id: GROUPME_BOT_ID, text: chunk }),
+      body: JSON.stringify({ bot_id: botId, text: chunk }),
     });
 
     if (!res.ok) {
@@ -213,21 +204,13 @@ async function postToGroupMe(text) {
 }
 
 const SCHEDULE_SHEET = process.env.SCHEDULE_SHEET || "Schedule";
-const SCHEDULE_POLL_MS = Number(process.env.SCHEDULE_POLL_MS || 60_000); // 1 min
-const SCHEDULE_LOOKAHEAD_MS = Number(process.env.SCHEDULE_LOOKAHEAD_MS || 2 * 60_000); // 2 min
+const SCHEDULE_POLL_MS = Number(process.env.SCHEDULE_POLL_MS || 60_000);
+const SCHEDULE_LOOKAHEAD_MS = Number(process.env.SCHEDULE_LOOKAHEAD_MS || 2 * 60_000);
 
 function toIso(dt) {
   return dt ? new Date(dt).toISOString() : new Date().toISOString();
 }
 
-/**
- * Reads scheduled messages and returns rows that are due.
- * Assumes columns:
- * A: SendAt (datetime)
- * B: Message
- * C: Sent (YES/blank)
- * D: SentAt
- */
 async function getDueScheduledMessages(now = new Date()) {
   const sheets = getSheetsClient();
   const range = `${SCHEDULE_SHEET}!A2:D`;
@@ -240,7 +223,6 @@ async function getDueScheduledMessages(now = new Date()) {
   const values = resp.data.values || [];
   const due = [];
 
-  // We treat "due" as: sendAt <= now and within lookahead window to be resilient
   const nowMs = now.getTime();
   const windowStart = nowMs - SCHEDULE_LOOKAHEAD_MS;
 
@@ -253,15 +235,12 @@ async function getDueScheduledMessages(now = new Date()) {
     if (!sendAtRaw || !message) continue;
     if (sent === "YES") continue;
 
-    // Google Sheets API returns datetimes as strings unless you use valueRenderOption.
-    // We'll parse permissively.
     const sendAt = new Date(sendAtRaw);
     if (isNaN(sendAt.getTime())) continue;
 
     const sendAtMs = sendAt.getTime();
 
     if (sendAtMs <= nowMs && sendAtMs >= windowStart) {
-      // rowIndex in sheet is i + 2 because range starts at A2
       due.push({
         rowIndex: i + 2,
         message,
@@ -276,7 +255,6 @@ async function getDueScheduledMessages(now = new Date()) {
 async function markScheduledMessageSent(rowIndex, sentAt = new Date()) {
   const sheets = getSheetsClient();
 
-  // Write "YES" to column C and ISO timestamp to column D
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SCHEDULE_SHEET}!C${rowIndex}:D${rowIndex}`,
@@ -285,16 +263,14 @@ async function markScheduledMessageSent(rowIndex, sentAt = new Date()) {
   });
 }
 
-/**
- * Polls schedule sheet, sends any due messages, and marks them sent.
- */
 async function runScheduleTick() {
   try {
     const due = await getDueScheduledMessages(new Date());
     if (!due.length) return;
 
     for (const item of due) {
-      await postToGroupMe(item.message);
+      // scheduled messages go to MAIN bot by default
+      await postToGroupMe(item.message, GROUPME_BOT_ID);
       await markScheduledMessageSent(item.rowIndex, new Date());
     }
   } catch (err) {
@@ -302,6 +278,34 @@ async function runScheduleTick() {
   }
 }
 
+// ✅ NEW: admin-only command handler (runs only in COMMAND_GROUP_ID)
+async function handleAdminCommands(text, replyBotId) {
+  const t = (text || "").trim();
+
+  if (t.toLowerCase() === "admin ping") {
+    await postToGroupMe("✅ Command bot online.", replyBotId);
+    return true;
+  }
+
+  if (t.toLowerCase() === "admin run schedule") {
+    await runScheduleTick();
+    await postToGroupMe("✅ Ran schedule tick.", replyBotId);
+    return true;
+  }
+
+  if (t.toLowerCase().startsWith("announce ")) {
+    const announcement = t.slice("announce ".length).trim();
+    if (announcement) {
+      await postToGroupMe(`📣 ${announcement}`, GROUPME_BOT_ID); // post to main group
+      await postToGroupMe("✅ Sent announcement to main group.", replyBotId);
+    } else {
+      await postToGroupMe("Usage: announce <message>", replyBotId);
+    }
+    return true;
+  }
+
+  return false;
+}
 
 app.post("/groupme", async (req, res) => {
   const msg = req.body;
@@ -311,50 +315,59 @@ app.post("/groupme", async (req, res) => {
 
     // Ignore bot messages to prevent loops
     if (msg.sender_type === "bot") return res.sendStatus(200);
-    if (GROUPME_BOT_ID && msg.sender_id === GROUPME_BOT_ID) return res.sendStatus(200);
+    // NOTE: sender_id is NOT bot_id; sender_type is the right loop guard.
 
-    const text = msg.text?.trim();
+    const text = msg.text?.trim() || "";
+    const groupId = (msg.group_id ?? "").toString();
 
-    // Respond to "Board Update"
+    const isCommandGroup = groupId === COMMAND_GROUP_ID;
+    const replyBotId = isCommandGroup ? COMMAND_BOT_ID : GROUPME_BOT_ID;
+
+    // ✅ Command group => admin-only commands
+    if (isCommandGroup) {
+      const handled = await handleAdminCommands(text, replyBotId);
+      if (!handled && text) {
+        await postToGroupMe(
+          "Unknown admin command.\nTry: admin ping | admin run schedule | announce <message>",
+          replyBotId
+        );
+      }
+      return res.sendStatus(200);
+    }
+
+    // MAIN group behavior unchanged from here down
+
     if (text && text.toLowerCase() === "board update") {
       const board = await buildLeaderboardMessage();
-      await postToGroupMe(board);
+      await postToGroupMe(board, replyBotId);
       return res.sendStatus(200);
     }
 
-// Respond to "Crown Jewel"
-if (text && text.toLowerCase() === "crown jewel") {
-  const crownMsg = await buildCrownJewelMessage();
-  await postToGroupMe(crownMsg);
-  return res.sendStatus(200);
-}
+    if (text && text.toLowerCase() === "crown jewel") {
+      const crownMsg = await buildCrownJewelMessage();
+      await postToGroupMe(crownMsg, replyBotId);
+      return res.sendStatus(200);
+    }
 
-    
-    // Respond to "wins"
     if (text && text.toLowerCase() === "wins") {
       const winsMsg = await buildWinsMessage();
-      await postToGroupMe(winsMsg);
+      await postToGroupMe(winsMsg, replyBotId);
       return res.sendStatus(200);
     }
 
-    // Only handle/import messages that contain #
     if (!text || !text.includes("#")) return res.sendStatus(200);
 
-    // Extract first hashtag token (e.g., "#2") from the message
     const pickToken = (text.match(/#[^\s]+/) || [text])[0];
 
-    // Look up driver count from "Driver Count" sheet
     const senderName = msg.name || "";
     const driverCount = await getDriverCountForPick(senderName, pickToken);
 
-    // Respond back to GroupMe
     if (driverCount !== null && driverCount !== undefined && driverCount !== "") {
-      await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`);
+      await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`, replyBotId);
     } else {
-      await postToGroupMe(`Pick Submitted, ${pickToken} - ?`);
+      await postToGroupMe(`Pick Submitted, ${pickToken} - ?`, replyBotId);
     }
 
-    // Append to Import tab
     const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
     const timestampIso = msg.created_at
       ? new Date(msg.created_at * 1000).toISOString()
@@ -387,13 +400,6 @@ setInterval(() => {
 // Optional: run once at startup
 runScheduleTick().catch(() => {});
 
-
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
-
-
-
-
-
-
 
