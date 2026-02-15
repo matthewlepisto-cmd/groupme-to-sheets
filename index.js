@@ -25,6 +25,8 @@ const RANGE_CROWN_JEWEL = `${LEADERBOARD_2026_TAB}!M1:N27`;
 const RANGE_TOP10S = `${LEADERBOARD_2026_TAB}!O1:P27`;
 const RANGE_TOP5S = `${LEADERBOARD_2026_TAB}!Q1:R27`;
 const RANGE_AVG_FINISH = `${LEADERBOARD_2026_TAB}!S1:T27`;
+const APPS_SCRIPT_WEBAPP_URL = process.env.APPS_SCRIPT_WEBAPP_URL;
+const APPS_SCRIPT_SECRET = process.env.APPS_SCRIPT_SECRET;
 
 if (!SPREADSHEET_ID || !GOOGLE_CREDS_JSON) {
   console.error("Missing env vars: SPREADSHEET_ID and/or GOOGLE_CREDS_JSON");
@@ -108,6 +110,27 @@ function getHelpText(isCommandGroup) {
     common +
     "\nNote: Admin/announce commands are only available in the command group."
   );
+}
+
+
+async function triggerRaces2026Import() {
+  if (!APPS_SCRIPT_WEBAPP_URL || !APPS_SCRIPT_SECRET) {
+    throw new Error("Missing APPS_SCRIPT_WEBAPP_URL or APPS_SCRIPT_SECRET");
+  }
+
+  const res = await fetch(APPS_SCRIPT_WEBAPP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      secret: APPS_SCRIPT_SECRET,
+      action: "races2026",
+    }),
+  });
+
+  const txt = await res.text().catch(() => "");
+  if (!res.ok || txt.toLowerCase().includes("unauthorized")) {
+    throw new Error(`Apps Script trigger failed: ${res.status} ${txt}`);
+  }
 }
 
 /**
@@ -550,6 +573,12 @@ async function handleAdminCommands(text, replyBotId) {
       );
       return true;
     }
+    if (t === "admin run races 2026") {
+      await postToGroupMe("⏳ Running Races 2026 import…", replyBotId);
+      await triggerRaces2026Import();
+      await postToGroupMe("✅ Races 2026 import triggered.", replyBotId);
+      return true;
+}
 
     // announce picks, <index>  (posts OUTPUT to MAIN)
     const mPicks = restLower.match(/^picks\s*,\s*(.+)$/i);
@@ -857,3 +886,4 @@ runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
