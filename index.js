@@ -17,6 +17,10 @@ const GROUPME_BOT_ID =
 const COMMAND_GROUP_ID = "110916855";
 const COMMAND_BOT_ID = "0cb4eb2388c240e337b026610a";
 
+// Apps Script trigger (Render env vars)
+const APPS_SCRIPT_WEBAPP_URL = process.env.APPS_SCRIPT_WEBAPP_URL; // https://script.google.com/macros/s/.../exec
+const APPS_SCRIPT_SECRET = process.env.APPS_SCRIPT_SECRET; // "run results 2026 - Dale"
+
 // 2026 LeaderBoard tab ranges
 const LEADERBOARD_2026_TAB = "2026 LeaderBoard";
 const RANGE_LEADERBOARD = `${LEADERBOARD_2026_TAB}!I1:J27`;
@@ -25,8 +29,6 @@ const RANGE_CROWN_JEWEL = `${LEADERBOARD_2026_TAB}!M1:N27`;
 const RANGE_TOP10S = `${LEADERBOARD_2026_TAB}!O1:P27`;
 const RANGE_TOP5S = `${LEADERBOARD_2026_TAB}!Q1:R27`;
 const RANGE_AVG_FINISH = `${LEADERBOARD_2026_TAB}!S1:T27`;
-const APPS_SCRIPT_WEBAPP_URL = process.env.APPS_SCRIPT_WEBAPP_URL;
-const APPS_SCRIPT_SECRET = process.env.APPS_SCRIPT_SECRET;
 
 if (!SPREADSHEET_ID || !GOOGLE_CREDS_JSON) {
   console.error("Missing env vars: SPREADSHEET_ID and/or GOOGLE_CREDS_JSON");
@@ -59,6 +61,35 @@ app.get("/", (req, res) => res.status(200).send("OK"));
 
 /**
  * =========================
+ * Apps Script trigger
+ * =========================
+ */
+async function triggerRaces2026Import() {
+  if (!APPS_SCRIPT_WEBAPP_URL || !APPS_SCRIPT_SECRET) {
+    throw new Error("Missing APPS_SCRIPT_WEBAPP_URL or APPS_SCRIPT_SECRET in Render env vars");
+  }
+
+  const res = await fetch(APPS_SCRIPT_WEBAPP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      secret: APPS_SCRIPT_SECRET,
+      action: "races2026",
+    }),
+  });
+
+  const txt = await res.text().catch(() => "");
+  if (!res.ok) {
+    throw new Error(`Apps Script HTTP ${res.status}: ${txt}`);
+  }
+  if ((txt || "").toLowerCase().includes("unauthorized")) {
+    throw new Error("Apps Script unauthorized (check APPS_SCRIPT_SECRET)");
+  }
+  return txt;
+}
+
+/**
+ * =========================
  * Help text
  * =========================
  */
@@ -81,6 +112,7 @@ function getHelpText(isCommandGroup) {
       "Admin commands:\n" +
       "• admin help\n" +
       "• admin status\n" +
+      "• admin results   (triggers Apps Script import to Races 2026)\n" +
       "• admin lock picks\n" +
       "• admin unlock picks\n" +
       "• admin rebuild leaderboard\n" +
@@ -110,27 +142,6 @@ function getHelpText(isCommandGroup) {
     common +
     "\nNote: Admin/announce commands are only available in the command group."
   );
-}
-
-
-async function triggerRaces2026Import() {
-  if (!APPS_SCRIPT_WEBAPP_URL || !APPS_SCRIPT_SECRET) {
-    throw new Error("Missing APPS_SCRIPT_WEBAPP_URL or APPS_SCRIPT_SECRET");
-  }
-
-  const res = await fetch(APPS_SCRIPT_WEBAPP_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      secret: APPS_SCRIPT_SECRET,
-      action: "races2026",
-    }),
-  });
-
-  const txt = await res.text().catch(() => "");
-  if (!res.ok || txt.toLowerCase().includes("unauthorized")) {
-    throw new Error(`Apps Script trigger failed: ${res.status} ${txt}`);
-  }
 }
 
 /**
@@ -341,10 +352,6 @@ async function buildAvgFinishMessage() {
  * =========================
  * Picks, Index (BOT Picks)
  * =========================
- * Command: "picks, 1"
- * - Lists names from A2:A30
- * - Finds the column where row 2 equals the index
- * - Title uses row 1 value of that same column
  */
 async function buildPicksIndexMessage(indexRaw) {
   const idx = (indexRaw ?? "").toString().trim();
@@ -352,7 +359,6 @@ async function buildPicksIndexMessage(indexRaw) {
 
   const sheets = getSheetsClient();
 
-  // Wide read so we can find the matching header in row 2 and also read row 1 label
   const range = `BOT Picks!A1:ZZ30`;
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -381,10 +387,9 @@ async function buildPicksIndexMessage(indexRaw) {
   const colLabel = (row1[targetCol] ?? "").toString().trim() || idx;
 
   const lines = [];
-  // rows 2..30 (1-based) => indices 1..29 (0-based)
   for (let r = 1; r <= 29 && r < values.length; r++) {
     const row = values[r] || [];
-    const name = (row[0] ?? "").toString().trim(); // column A
+    const name = (row[0] ?? "").toString().trim();
     if (!name || name.toLowerCase() === "name") continue;
 
     const val = (row[targetCol] ?? "").toString().trim();
@@ -503,7 +508,6 @@ async function runScheduleTick() {
     if (!due.length) return;
 
     for (const item of due) {
-      // Scheduled messages always go to MAIN group (main bot)
       await postToGroupMe(item.message, GROUPME_BOT_ID);
       await markScheduledMessageSent(item.rowIndex, new Date());
     }
@@ -545,9 +549,6 @@ async function resetCrownJewel() {
  * =========================
  * Admin command handler
  * =========================
- * Runs ONLY in command group.
- * - "announce <msg>" generic announce to main/command/both
- * - "announce wins" etc posts OUTPUT to MAIN group
  */
 async function handleAdminCommands(text, replyBotId) {
   const raw = (text || "").trim();
@@ -555,6 +556,18 @@ async function handleAdminCommands(text, replyBotId) {
 
   if (t === "admin help") {
     await postToGroupMe(getHelpText(true), replyBotId);
+    return true;
+  }
+
+  // ✅ NEW: Trigger Apps Script import (Races 2026)
+  if (t === "admin results") {
+    try {
+      await postToGroupMe("⏳ Triggering Races 2026 import…", replyBotId);
+      const respTxt = await triggerRaces2026Import();
+      await postToGroupMe(`✅ Import triggered. (Apps Script: ${String(respTxt).trim() || "ok"})`, replyBotId);
+    } catch (e) {
+      await postToGroupMe(`❌ Failed to trigger import: ${e?.message || e}`, replyBotId);
+    }
     return true;
   }
 
@@ -573,14 +586,7 @@ async function handleAdminCommands(text, replyBotId) {
       );
       return true;
     }
-    if (t === "admin run races 2026") {
-      await postToGroupMe("⏳ Running Races 2026 import…", replyBotId);
-      await triggerRaces2026Import();
-      await postToGroupMe("✅ Races 2026 import triggered.", replyBotId);
-      return true;
-}
 
-    // announce picks, <index>  (posts OUTPUT to MAIN)
     const mPicks = restLower.match(/^picks\s*,\s*(.+)$/i);
     if (mPicks) {
       const idx = (mPicks[1] ?? "").toString().trim();
@@ -590,7 +596,6 @@ async function handleAdminCommands(text, replyBotId) {
       return true;
     }
 
-    // announce-to-main stat shortcuts (posts OUTPUT to MAIN)
     let statMsg = null;
     if (restLower === "wins") statMsg = await buildWinsMessage();
     else if (restLower === "board update" || restLower === "leaderboard")
@@ -613,7 +618,6 @@ async function handleAdminCommands(text, replyBotId) {
       return true;
     }
 
-    // generic announce text (defaults to main)
     const firstWord = restLower.split(/\s+/)[0];
     const targets = ["main", "command", "both"];
 
@@ -738,7 +742,6 @@ async function handleAdminCommands(text, replyBotId) {
  * =========================
  * Shared handler for main commands (works in both groups)
  * =========================
- * Replies only to the group where the command was posted (replyBotId).
  */
 async function handleMainCommands({ msg, text, replyBotId }) {
   const raw = (text || "").trim();
@@ -786,7 +789,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // Picks, Index (picks, 1)
   const mPicks = raw.match(/^picks\s*,\s*(.+)$/i);
   if (mPicks) {
     const idx = (mPicks[1] ?? "").toString().trim();
@@ -795,7 +797,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // Pick submission (#2)
   if (!raw.includes("#")) return false;
 
   if (await isPicksLocked()) {
@@ -852,10 +853,8 @@ app.post("/groupme", async (req, res) => {
     const groupId = (msg.group_id ?? "").toString();
     const isCommandGroup = groupId === COMMAND_GROUP_ID;
 
-    // Replies in each group must come from the bot that belongs to that group
     const replyBotId = isCommandGroup ? COMMAND_BOT_ID : GROUPME_BOT_ID;
 
-    // Universal help shortcut
     if (text && text.toLowerCase().trim() === "help") {
       await postToGroupMe(getHelpText(isCommandGroup), replyBotId);
       return res.sendStatus(200);
@@ -886,4 +885,3 @@ runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
-
