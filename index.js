@@ -17,7 +17,7 @@ const GROUPME_BOT_ID =
 const COMMAND_GROUP_ID = "110916855";
 const COMMAND_BOT_ID = "0cb4eb2388c240e337b026610a";
 
-// Unified 2026 tab source + ranges
+// 2026 LeaderBoard tab ranges
 const LEADERBOARD_2026_TAB = "2026 LeaderBoard";
 const RANGE_LEADERBOARD = `${LEADERBOARD_2026_TAB}!I1:J27`;
 const RANGE_WINS = `${LEADERBOARD_2026_TAB}!K1:L27`;
@@ -77,7 +77,6 @@ function getHelpText(isCommandGroup) {
     return (
       "🤖 Command Bot Help\n\n" +
       "Admin commands:\n" +
-      "• run_results\n" +
       "• admin help\n" +
       "• admin status\n" +
       "• admin lock picks\n" +
@@ -86,7 +85,12 @@ function getHelpText(isCommandGroup) {
       "• admin clear import\n" +
       "• admin reset crown jewel\n" +
       "• admin set poll 30000\n\n" +
-      "Announce-to-main (run here, posts in MAIN group):\n" +
+      "Announce (generic):\n" +
+      "• announce <msg>\n" +
+      "• announce main <msg>\n" +
+      "• announce command <msg>\n" +
+      "• announce both <msg>\n\n" +
+      "Announce-to-main (run here, posts OUTPUT in MAIN group):\n" +
       "• announce wins\n" +
       "• announce board update\n" +
       "• announce crown jewel\n" +
@@ -283,13 +287,19 @@ async function buildTwoColMessage({ title, rangeA1 }) {
 }
 
 async function buildLeaderboardMessage() {
-  return buildTwoColMessage({ title: "🏁 Leaderboard", rangeA1: RANGE_LEADERBOARD });
+  return buildTwoColMessage({
+    title: "🏁 Leaderboard",
+    rangeA1: RANGE_LEADERBOARD,
+  });
 }
 async function buildWinsMessage() {
   return buildTwoColMessage({ title: "🏆 Wins", rangeA1: RANGE_WINS });
 }
 async function buildCrownJewelMessage() {
-  return buildTwoColMessage({ title: "👑 Crown Jewel Standings", rangeA1: RANGE_CROWN_JEWEL });
+  return buildTwoColMessage({
+    title: "👑 Crown Jewel Standings",
+    rangeA1: RANGE_CROWN_JEWEL,
+  });
 }
 async function buildTop10sMessage() {
   return buildTwoColMessage({ title: "🔟 Top 10s", rangeA1: RANGE_TOP10S });
@@ -298,7 +308,10 @@ async function buildTop5sMessage() {
   return buildTwoColMessage({ title: "🖐️ Top 5s", rangeA1: RANGE_TOP5S });
 }
 async function buildAvgFinishMessage() {
-  return buildTwoColMessage({ title: "📊 Avg Finish", rangeA1: RANGE_AVG_FINISH });
+  return buildTwoColMessage({
+    title: "📊 Avg Finish",
+    rangeA1: RANGE_AVG_FINISH,
+  });
 }
 
 /**
@@ -308,7 +321,7 @@ async function buildAvgFinishMessage() {
  * Command: "picks, 1"
  * - Lists names from A2:A30
  * - Finds the column where row 2 equals the index
- * - Outputs "Name — value" for that column
+ * - Title uses row 1 value of that same column
  */
 async function buildPicksIndexMessage(indexRaw) {
   const idx = (indexRaw ?? "").toString().trim();
@@ -316,7 +329,7 @@ async function buildPicksIndexMessage(indexRaw) {
 
   const sheets = getSheetsClient();
 
-  // Pull a wide block so we can find the matching header in row 2 and read values for rows 2-30.
+  // Wide read so we can find the matching header in row 2 and also read row 1 label
   const range = `BOT Picks!A1:ZZ30`;
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -326,13 +339,12 @@ async function buildPicksIndexMessage(indexRaw) {
   const values = resp.data.values || [];
   if (values.length < 3) return "BOT Picks tab does not have enough rows.";
 
-  // Row 2 (1-based) is index 1 (0-based)
-  const headerRow = values[1] || [];
+  const row1 = values[0] || []; // label row
+  const row2 = values[1] || []; // index row
 
-  // Find first column where headerRow[col] == idx (string compare)
   let targetCol = -1;
-  for (let c = 0; c < headerRow.length; c++) {
-    const v = (headerRow[c] ?? "").toString().trim();
+  for (let c = 0; c < row2.length; c++) {
+    const v = (row2[c] ?? "").toString().trim();
     if (v === idx) {
       targetCol = c;
       break;
@@ -343,8 +355,10 @@ async function buildPicksIndexMessage(indexRaw) {
     return `No column found in BOT Picks where row 2 equals "${idx}".`;
   }
 
-  // Rows 2..30 (1-based) => indices 1..29 (0-based)
+  const colLabel = (row1[targetCol] ?? "").toString().trim() || idx;
+
   const lines = [];
+  // rows 2..30 (1-based) => indices 1..29 (0-based)
   for (let r = 1; r <= 29 && r < values.length; r++) {
     const row = values[r] || [];
     const name = (row[0] ?? "").toString().trim(); // column A
@@ -354,8 +368,8 @@ async function buildPicksIndexMessage(indexRaw) {
     lines.push(`${String(lines.length + 1).padStart(2, " ")}. ${name} — ${val}`);
   }
 
-  if (!lines.length) return `Picks, ${idx}\n(no rows found in A2:A30)`;
-  return `🧾 Picks, ${idx}\n` + lines.join("\n");
+  if (!lines.length) return `🧾 Picks, ${colLabel}\n(no rows found in A2:A30)`;
+  return `🧾 Picks, ${colLabel}\n` + lines.join("\n");
 }
 
 /**
@@ -508,85 +522,112 @@ async function resetCrownJewel() {
  * =========================
  * Admin command handler
  * =========================
- * NOTE: Runs ONLY in command group.
- * "announce <stat>" commands post the OUTPUT to the MAIN group.
+ * Runs ONLY in command group.
+ * - "announce <msg>" generic announce to main/command/both
+ * - "announce wins" etc posts OUTPUT to MAIN group
  */
 async function handleAdminCommands(text, replyBotId) {
   const raw = (text || "").trim();
   const t = raw.toLowerCase().trim();
 
-  // admin help
   if (t === "admin help") {
     await postToGroupMe(getHelpText(true), replyBotId);
     return true;
   }
 
-  /**
-   * Announce-to-main shortcuts (command group only)
-   * - announce wins
-   * - announce board update
-   * - announce crown jewel
-   * - announce top 10s
-   * - announce top 5s
-   * - announce avg finish
-   * - announce picks, <index>
-   */
+  // ✅ Announce (generic + announce-to-main outputs)
   if (t.startsWith("announce")) {
-    // normalize "announce something"
     const rest = raw.slice("announce".length).trim();
     const restLower = rest.toLowerCase().trim();
 
-    // announce picks, <index>
+    if (!rest) {
+      await postToGroupMe(
+        "Usage:\n" +
+          "announce <msg>\nannounce main <msg>\nannounce command <msg>\nannounce both <msg>\n\n" +
+          "Or announce-to-main outputs:\n" +
+          "announce wins\nannounce board update\nannounce crown jewel\nannounce top 10s\nannounce top 5s\nannounce avg finish\nannounce picks, <index>",
+        replyBotId
+      );
+      return true;
+    }
+
+    // announce picks, <index>  (posts OUTPUT to MAIN)
     const mPicks = restLower.match(/^picks\s*,\s*(.+)$/i);
     if (mPicks) {
       const idx = (mPicks[1] ?? "").toString().trim();
       const msgTxt = await buildPicksIndexMessage(idx);
-      await postToGroupMe(msgTxt, GROUPME_BOT_ID); // post to MAIN
-      await postToGroupMe(`✅ Announced Picks, ${idx} to the MAIN group.`, replyBotId);
+      await postToGroupMe(msgTxt, GROUPME_BOT_ID);
+      await postToGroupMe(`✅ Announced Picks (${idx}) to the MAIN group.`, replyBotId);
       return true;
     }
 
-    let msgTxt = null;
-    if (restLower === "wins") msgTxt = await buildWinsMessage();
+    // announce-to-main stat shortcuts (posts OUTPUT to MAIN)
+    let statMsg = null;
+    if (restLower === "wins") statMsg = await buildWinsMessage();
     else if (restLower === "board update" || restLower === "leaderboard")
-      msgTxt = await buildLeaderboardMessage();
-    else if (restLower === "crown jewel") msgTxt = await buildCrownJewelMessage();
+      statMsg = await buildLeaderboardMessage();
+    else if (restLower === "crown jewel") statMsg = await buildCrownJewelMessage();
     else if (restLower === "top 10s" || restLower === "top10s" || restLower === "top 10")
-      msgTxt = await buildTop10sMessage();
+      statMsg = await buildTop10sMessage();
     else if (restLower === "top 5s" || restLower === "top5s" || restLower === "top 5")
-      msgTxt = await buildTop5sMessage();
+      statMsg = await buildTop5sMessage();
     else if (
       restLower === "avg finish" ||
       restLower === "avgfinish" ||
       restLower === "average finish"
     )
-      msgTxt = await buildAvgFinishMessage();
+      statMsg = await buildAvgFinishMessage();
 
-    if (msgTxt) {
-      await postToGroupMe(msgTxt, GROUPME_BOT_ID); // post to MAIN
+    if (statMsg) {
+      await postToGroupMe(statMsg, GROUPME_BOT_ID);
       await postToGroupMe("✅ Announced to the MAIN group.", replyBotId);
       return true;
     }
 
-    // If they typed "announce ..." but not one of the supported announce commands:
-    await postToGroupMe(
-      "Unknown announce command.\n" +
-        "Use:\n" +
-        "announce wins\nannounce board update\nannounce crown jewel\nannounce top 10s\nannounce top 5s\nannounce avg finish\nannounce picks, <index>",
-      replyBotId
-    );
-    return true;
+    // generic announce text (defaults to main)
+    const firstWord = restLower.split(/\s+/)[0];
+    const targets = ["main", "command", "both"];
+
+    let mode = "main";
+    let msgText = rest;
+
+    if (targets.includes(firstWord)) {
+      mode = firstWord;
+      msgText = rest.slice(firstWord.length).trim();
+    }
+
+    if (!msgText) {
+      await postToGroupMe("Usage: announce (main|command|both) <message>", replyBotId);
+      return true;
+    }
+
+    const final = `📣 ${msgText}`;
+
+    if (mode === "main") {
+      await postToGroupMe(final, GROUPME_BOT_ID);
+      await postToGroupMe("✅ Announced to MAIN.", replyBotId);
+      return true;
+    }
+    if (mode === "command") {
+      await postToGroupMe(final, COMMAND_BOT_ID);
+      return true;
+    }
+    if (mode === "both") {
+      await postToGroupMe(final, GROUPME_BOT_ID);
+      await postToGroupMe(final, COMMAND_BOT_ID);
+      await postToGroupMe("✅ Announced to BOTH.", replyBotId);
+      return true;
+    }
   }
 
-  // admin status
   if (t === "admin status") {
     const locked = await getSetting("LOCK_PICKS");
     const lockedHuman =
       locked === null
         ? "unknown (create Settings tab)"
         : (await isPicksLocked())
-          ? "LOCKED"
-          : "UNLOCKED";
+        ? "LOCKED"
+        : "UNLOCKED";
 
     const persistedPoll = await getSetting("SCHEDULE_POLL_MS");
     const upSec = Math.floor((Date.now() - startedAt) / 1000);
@@ -604,7 +645,6 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // lock picks
   if (t === "admin lock picks") {
     await setSetting("LOCK_PICKS", "TRUE");
     await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
@@ -612,7 +652,6 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // unlock picks
   if (t === "admin unlock picks") {
     await setSetting("LOCK_PICKS", "FALSE");
     await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
@@ -620,7 +659,6 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // rebuild leaderboard (posts current leaderboard to main group)
   if (t === "admin rebuild leaderboard") {
     const board = await buildLeaderboardMessage();
     await postToGroupMe(board, GROUPME_BOT_ID);
@@ -628,14 +666,12 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // clear import
   if (t === "admin clear import") {
     await clearImportSheet();
     await postToGroupMe(`✅ Cleared ${SHEET_NAME} rows (kept headers).`, replyBotId);
     return true;
   }
 
-  // reset crown jewel (kept as-is; you can point it to 2026 LeaderBoard if desired later)
   if (t === "admin reset crown jewel") {
     await resetCrownJewel();
     await postToGroupMe("✅ Reset Crown Jewel points (cleared B12:B37).", replyBotId);
@@ -643,8 +679,6 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // set poll (ms)
-  // example: "admin set poll 30000"
   if (t.startsWith("admin set poll")) {
     const parts = raw.split(/\s+/);
     const msStr = parts[parts.length - 1];
@@ -658,11 +692,10 @@ async function handleAdminCommands(text, replyBotId) {
     SCHEDULE_POLL_MS = ms;
     startScheduleInterval();
 
-    // persist in Settings sheet if present
     try {
       await setSetting("SCHEDULE_POLL_MS", String(ms));
     } catch {
-      // ignore; still applied in memory
+      // ignore
     }
 
     await postToGroupMe(`✅ Schedule poll set to ${ms} ms.`, replyBotId);
@@ -676,8 +709,7 @@ async function handleAdminCommands(text, replyBotId) {
  * =========================
  * Shared handler for main commands (works in both groups)
  * =========================
- * - Replies using replyBotId (main bot in main group, command bot in command group)
- * - Picks: append to Import, wait for formula, respond with count
+ * Replies only to the group where the command was posted (replyBotId).
  */
 async function handleMainCommands({ msg, text, replyBotId }) {
   const raw = (text || "").trim();
@@ -725,8 +757,7 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // Picks, Index
-  // Accepts: "picks, 1" / "Picks,1" / "picks ,  1"
+  // Picks, Index (picks, 1)
   const mPicks = raw.match(/^picks\s*,\s*(.+)$/i);
   if (mPicks) {
     const idx = (mPicks[1] ?? "").toString().trim();
@@ -735,7 +766,7 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // Picks submission
+  // Pick submission (#2)
   if (!raw.includes("#")) return false;
 
   if (await isPicksLocked()) {
@@ -746,7 +777,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
   const pickToken = (raw.match(/#\d+/) || [null])[0];
   if (!pickToken) return false;
 
-  // Append to Import FIRST (so formulas can update)
   const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
   const timestampIso = msg.created_at
     ? new Date(msg.created_at * 1000).toISOString()
@@ -765,7 +795,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
 
   await appendRow(row);
 
-  // Now wait/read Driver Count after formulas recalc
   const senderName = msg.name || "";
   const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
 
@@ -797,13 +826,12 @@ app.post("/groupme", async (req, res) => {
     // Replies in each group must come from the bot that belongs to that group
     const replyBotId = isCommandGroup ? COMMAND_BOT_ID : GROUPME_BOT_ID;
 
-    // Universal help
-    if (text && text.toLowerCase() === "help") {
+    // Universal help shortcut
+    if (text && text.toLowerCase().trim() === "help") {
       await postToGroupMe(getHelpText(isCommandGroup), replyBotId);
       return res.sendStatus(200);
     }
 
-    // Command group: admin commands first, then allow main commands too
     if (isCommandGroup) {
       const adminHandled = await handleAdminCommands(text, replyBotId);
       if (adminHandled) return res.sendStatus(200);
@@ -815,7 +843,6 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Main group: main commands only
     await handleMainCommands({ msg, text, replyBotId });
     return res.sendStatus(200);
   } catch (err) {
