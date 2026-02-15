@@ -10,8 +10,7 @@ const SHEET_NAME = process.env.SHEET_NAME || "Import";
 const GOOGLE_CREDS_JSON = process.env.GOOGLE_CREDS_JSON;
 
 // MAIN bot (posts to main group)
-const GROUPME_BOT_ID =
-  process.env.GROUPME_BOT_ID || "08d51442da9b9a749a7e6bd04d";
+const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || "08d51442da9b9a749a7e6bd04d";
 
 // COMMAND bot (admin group only)
 const COMMAND_GROUP_ID = "110916855";
@@ -50,11 +49,6 @@ app.get("/", (req, res) => res.status(200).send("OK"));
  * =========================
  * Settings helpers (Sheets)
  * =========================
- * Requires a tab named "Settings" with:
- * Col A = key, Col B = value
- * Example:
- * LOCK_PICKS | TRUE
- * SCHEDULE_POLL_MS | 60000
  */
 const SETTINGS_SHEET = process.env.SETTINGS_SHEET || "Settings";
 
@@ -74,8 +68,7 @@ async function getSetting(key) {
       if (kk === k) return (r?.[1] ?? "").toString().trim();
     }
     return null;
-  } catch (e) {
-    // Most common cause: Settings sheet doesn't exist
+  } catch {
     return null;
   }
 }
@@ -85,7 +78,6 @@ async function setSetting(key, value) {
   const k = (key ?? "").toString().trim().toUpperCase();
   const v = (value ?? "").toString().trim();
 
-  // Read all to find existing row
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SETTINGS_SHEET}!A:B`,
@@ -102,7 +94,6 @@ async function setSetting(key, value) {
   }
 
   if (rowIndex === -1) {
-    // append new setting
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
       range: `${SETTINGS_SHEET}!A1`,
@@ -111,7 +102,6 @@ async function setSetting(key, value) {
       requestBody: { values: [[k, v]] },
     });
   } else {
-    // update existing setting row
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range: `${SETTINGS_SHEET}!A${rowIndex}:B${rowIndex}`,
@@ -129,7 +119,7 @@ async function isPicksLocked() {
 
 /**
  * =========================
- * Your existing functions
+ * Driver Count lookup
  * =========================
  */
 async function getDriverCountForPick(senderName, pickToken) {
@@ -181,6 +171,27 @@ async function getDriverCountForPick(senderName, pickToken) {
   return null;
 }
 
+/**
+ * Step-2 helper: retry for formula recalculation
+ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getDriverCountForPickWithRetry(senderName, pickToken, tries = 6, delayMs = 700) {
+  for (let i = 0; i < tries; i++) {
+    const count = await getDriverCountForPick(senderName, pickToken);
+    if (count !== null && count !== undefined && String(count).trim() !== "") {
+      return String(count).trim();
+    }
+    await sleep(delayMs);
+  }
+  return null;
+}
+
+/**
+ * =========================
+ * Leaderboards
+ * =========================
+ */
 async function buildWinsMessage() {
   const sheets = getSheetsClient();
   const range = `WINS!A1:B27`;
@@ -360,7 +371,6 @@ async function runScheduleTick() {
     if (!due.length) return;
 
     for (const item of due) {
-      // scheduled messages go to MAIN bot
       await postToGroupMe(item.message, GROUPME_BOT_ID);
       await markScheduledMessageSent(item.rowIndex, new Date());
     }
@@ -369,7 +379,6 @@ async function runScheduleTick() {
   }
 }
 
-// interval control so admin can change poll ms
 let scheduleIntervalId = null;
 function startScheduleInterval() {
   if (scheduleIntervalId) clearInterval(scheduleIntervalId);
@@ -380,12 +389,11 @@ function startScheduleInterval() {
 
 /**
  * =========================
- * Admin actions (Sheets ops)
+ * Admin actions
  * =========================
  */
 async function clearImportSheet() {
   const sheets = getSheetsClient();
-  // Clears everything below the header row (row 1)
   await sheets.spreadsheets.values.clear({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SHEET_NAME}!A2:Z`,
@@ -394,27 +402,24 @@ async function clearImportSheet() {
 
 async function resetCrownJewel() {
   const sheets = getSheetsClient();
-  // Clears points column in the Crown Jewel range (keeps names)
   await sheets.spreadsheets.values.clear({
     spreadsheetId: SPREADSHEET_ID,
     range: `Crown Jewel!B12:B37`,
   });
 }
 
-/**
- * =========================
- * Admin command handler
- * =========================
- */
 async function handleAdminCommands(text, replyBotId) {
   const raw = (text || "").trim();
   const t = raw.toLowerCase();
 
-  // admin status
   if (t === "admin status") {
     const locked = await getSetting("LOCK_PICKS");
     const lockedHuman =
-      locked === null ? "unknown (create Settings tab)" : (await isPicksLocked()) ? "LOCKED" : "UNLOCKED";
+      locked === null
+        ? "unknown (create Settings tab)"
+        : (await isPicksLocked())
+          ? "LOCKED"
+          : "UNLOCKED";
 
     const persistedPoll = await getSetting("SCHEDULE_POLL_MS");
     const upSec = Math.floor((Date.now() - startedAt) / 1000);
@@ -432,38 +437,20 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // lock picks
   if (t === "admin lock picks") {
-    try {
-      await setSetting("LOCK_PICKS", "TRUE");
-      await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
-      // optional: announce to main group
-      await postToGroupMe("🔒 Picks are now LOCKED.", GROUPME_BOT_ID);
-    } catch {
-      await postToGroupMe(
-        "❌ Could not lock picks. Make sure you created a sheet tab named 'Settings' (A=key, B=value).",
-        replyBotId
-      );
-    }
+    await setSetting("LOCK_PICKS", "TRUE");
+    await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
+    await postToGroupMe("🔒 Picks are now LOCKED.", GROUPME_BOT_ID);
     return true;
   }
 
-  // unlock picks
   if (t === "admin unlock picks") {
-    try {
-      await setSetting("LOCK_PICKS", "FALSE");
-      await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
-      await postToGroupMe("🔓 Picks are now UNLOCKED.", GROUPME_BOT_ID);
-    } catch {
-      await postToGroupMe(
-        "❌ Could not unlock picks. Make sure you created a sheet tab named 'Settings' (A=key, B=value).",
-        replyBotId
-      );
-    }
+    await setSetting("LOCK_PICKS", "FALSE");
+    await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
+    await postToGroupMe("🔓 Picks are now UNLOCKED.", GROUPME_BOT_ID);
     return true;
   }
 
-  // rebuild leaderboard (posts current leaderboard to main group)
   if (t === "admin rebuild leaderboard") {
     const board = await buildLeaderboardMessage();
     await postToGroupMe(board, GROUPME_BOT_ID);
@@ -471,14 +458,12 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // clear import
   if (t === "admin clear import") {
     await clearImportSheet();
     await postToGroupMe(`✅ Cleared ${SHEET_NAME} rows (kept headers).`, replyBotId);
     return true;
   }
 
-  // reset crown jewel
   if (t === "admin reset crown jewel") {
     await resetCrownJewel();
     await postToGroupMe("✅ Reset Crown Jewel points (cleared B12:B37).", replyBotId);
@@ -486,8 +471,6 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // set poll (ms)
-  // example: "admin set poll 30000"
   if (t.startsWith("admin set poll")) {
     const parts = raw.split(/\s+/);
     const msStr = parts[parts.length - 1];
@@ -501,24 +484,17 @@ async function handleAdminCommands(text, replyBotId) {
     SCHEDULE_POLL_MS = ms;
     startScheduleInterval();
 
-    // persist in Settings sheet if present
     try {
       await setSetting("SCHEDULE_POLL_MS", String(ms));
     } catch {
-      // ignore; still applied in memory
+      // ignore
     }
 
     await postToGroupMe(`✅ Schedule poll set to ${ms} ms.`, replyBotId);
     return true;
   }
 
-  /**
-   * Updated announce:
-   * - announce <msg> (defaults to main)
-   * - announce main <msg>
-   * - announce command <msg>
-   * - announce both <msg>
-   */
+  // announce / announce main / announce command / announce both
   if (t.startsWith("announce ")) {
     const rest = raw.slice("announce ".length).trim();
     if (!rest) {
@@ -553,12 +529,10 @@ async function handleAdminCommands(text, replyBotId) {
       await postToGroupMe("✅ Announced to main group.", replyBotId);
       return true;
     }
-
     if (mode === "command") {
       await postToGroupMe(final, COMMAND_BOT_ID);
       return true;
     }
-
     if (mode === "both") {
       await postToGroupMe(final, GROUPME_BOT_ID);
       await postToGroupMe(final, COMMAND_BOT_ID);
@@ -602,20 +576,7 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getDriverCountForPickWithRetry(senderName, pickToken, tries = 6, delayMs = 700) {
-  for (let i = 0; i < tries; i++) {
-    const count = await getDriverCountForPick(senderName, pickToken);
-    if (count !== null && count !== undefined && String(count).trim() !== "") {
-      return String(count).trim();
-    }
-    await sleep(delayMs);
-  }
-  return null;
-}
-
-    // MAIN GROUP: unchanged commands
+    // MAIN GROUP: fixed order for formula-based counts
 
     if (text && text.toLowerCase() === "board update") {
       const board = await buildLeaderboardMessage();
@@ -638,51 +599,51 @@ async function getDriverCountForPickWithRetry(senderName, pickToken, tries = 6, 
     // only handle/import messages that contain #
     if (!text || !text.includes("#")) return res.sendStatus(200);
 
-    // 🔒 Enforce pick locking (admin controls via Settings sheet)
+    // Enforce pick locking
     if (await isPicksLocked()) {
       await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
       return res.sendStatus(200);
     }
 
-// Only handle/import messages that contain #
-if (!text || !text.includes("#")) return res.sendStatus(200);
+    // Safer pick token: "#<digits>"
+    const pickToken = (text.match(/#\d+/) || [null])[0];
+    if (!pickToken) return res.sendStatus(200);
 
-// Safer: only capture "#<digits>"
-const pickToken = (text.match(/#\d+/) || [null])[0];
-if (!pickToken) return res.sendStatus(200);
+    // Append to Import FIRST (so formulas can update)
+    const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
+    const timestampIso = msg.created_at
+      ? new Date(msg.created_at * 1000).toISOString()
+      : new Date().toISOString();
+    const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
 
-// Append to Import tab FIRST (so formulas can update)
-const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-const timestampIso = msg.created_at
-  ? new Date(msg.created_at * 1000).toISOString()
-  : new Date().toISOString();
-const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
+    const row = [
+      timestampIso,
+      msg.group_id || "",
+      msg.sender_id || "",
+      msg.name || "",
+      text || "",
+      attachmentsJson,
+      msg.id || "",
+    ];
 
-const row = [
-  timestampIso,
-  msg.group_id || "",
-  msg.sender_id || "",
-  msg.name || "",
-  text || "",
-  attachmentsJson,
-  msg.id || "",
-];
+    await appendRow(row);
 
-await appendRow(row);
+    // Now wait/read Driver Count after formulas recalc
+    const senderName = msg.name || "";
+    const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
 
-// Now wait/read Driver Count after formulas recalc
-const senderName = msg.name || "";
-const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
+    if (driverCount) {
+      await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`, replyBotId);
+    } else {
+      await postToGroupMe(`Pick Submitted, ${pickToken} - ?`, replyBotId);
+    }
 
-// Respond back to GroupMe with count (or ? if still not ready)
-if (driverCount) {
-  await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`);
-} else {
-  await postToGroupMe(`Pick Submitted, ${pickToken} - ?`);
-}
-
-return res.sendStatus(200);
-
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error("Webhook error:", err);
+    return res.sendStatus(200);
+  }
+});
 
 // Kick off schedule polling (and allow admin set poll to update it)
 startScheduleInterval();
