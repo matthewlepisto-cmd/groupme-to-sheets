@@ -17,6 +17,15 @@ const GROUPME_BOT_ID =
 const COMMAND_GROUP_ID = "110916855";
 const COMMAND_BOT_ID = "0cb4eb2388c240e337b026610a";
 
+// Unified 2026 tab source + ranges
+const LEADERBOARD_2026_TAB = "2026 LeaderBoard";
+const RANGE_LEADERBOARD = `${LEADERBOARD_2026_TAB}!I1:J27`;
+const RANGE_WINS = `${LEADERBOARD_2026_TAB}!K1:L27`;
+const RANGE_CROWN_JEWEL = `${LEADERBOARD_2026_TAB}!M1:N27`;
+const RANGE_TOP10S = `${LEADERBOARD_2026_TAB}!O1:P27`;
+const RANGE_TOP5S = `${LEADERBOARD_2026_TAB}!Q1:R27`;
+const RANGE_AVG_FINISH = `${LEADERBOARD_2026_TAB}!S1:T27`;
+
 if (!SPREADSHEET_ID || !GOOGLE_CREDS_JSON) {
   console.error("Missing env vars: SPREADSHEET_ID and/or GOOGLE_CREDS_JSON");
   process.exit(1);
@@ -52,9 +61,21 @@ app.get("/", (req, res) => res.status(200).send("OK"));
  * =========================
  */
 function getHelpText(isCommandGroup) {
+  const common =
+    "Commands:\n" +
+    "• help\n" +
+    "• board update\n" +
+    "• wins\n" +
+    "• crown jewel\n" +
+    "• top 10s\n" +
+    "• top 5s\n" +
+    "• avg finish\n" +
+    "• #<number> (example: #2)\n";
+
   if (isCommandGroup) {
     return (
       "🤖 Command Bot Help\n\n" +
+      "• run_results\n" +
       "Admin commands:\n" +
       "• admin help\n" +
       "• admin status\n" +
@@ -70,23 +91,14 @@ function getHelpText(isCommandGroup) {
       "• announce command <msg>\n" +
       "• announce both <msg>\n\n" +
       "Main commands (also work here):\n" +
-      "• help\n" +
-      "• board update\n" +
-      "• wins\n" +
-      "• crown jewel\n" +
-      "• #<number> (example: #2)"
+      common
     );
   }
 
   return (
     "🏁 Bot Help\n\n" +
-    "Commands:\n" +
-    "• help\n" +
-    "• board update\n" +
-    "• wins\n" +
-    "• crown jewel\n" +
-    "• #<number> (example: #2)\n\n" +
-    "Note: Admin commands are only available in the command group."
+    common +
+    "\nNote: Admin commands are only available in the command group."
   );
 }
 
@@ -239,80 +251,58 @@ async function getDriverCountForPickWithRetry(
 
 /**
  * =========================
- * Leaderboards
+ * Leaderboard block reader
  * =========================
  */
-async function buildWinsMessage() {
+async function buildTwoColMessage({ title, rangeA1 }) {
   const sheets = getSheetsClient();
-  const range = `WINS!A1:B27`;
 
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range,
+    range: rangeA1,
   });
 
   const values = resp.data.values || [];
-  if (values.length < 2) return "WINS tab is empty.";
+  if (values.length < 2) return `${title}\n(no data)`;
 
-  const rows = values.slice(1);
+  const rows = values.slice(1); // skip header row
 
   const lines = rows
-    .filter((r) => (r[0] ?? "").toString().trim() !== "")
+    .filter((r) => (r?.[0] ?? "").toString().trim() !== "")
     .map((r, i) => {
-      const name = (r[0] ?? "").toString().trim();
-      const wins = (r[1] ?? "").toString().trim();
-      return `${String(i + 1).padStart(2, " ")}. ${name} — ${wins}`;
+      const name = (r?.[0] ?? "").toString().trim();
+      const val = (r?.[1] ?? "").toString().trim();
+      return `${String(i + 1).padStart(2, " ")}. ${name} — ${val}`;
     });
 
-  return "🏆 Wins\n" + lines.join("\n");
-}
-
-async function buildCrownJewelMessage() {
-  const sheets = getSheetsClient();
-  const range = `Crown Jewel!A12:B37`;
-
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range,
-  });
-
-  const values = resp.data.values || [];
-  if (!values.length) return "Crown Jewel tab is empty.";
-
-  const lines = values
-    .filter((r) => (r[0] ?? "").toString().trim() !== "")
-    .map((r, i) => {
-      const name = (r[0] ?? "").toString().trim();
-      const pts = (r[1] ?? "").toString().trim();
-      return `${String(i + 1).padStart(2, " ")}. ${name} — ${pts}`;
-    });
-
-  return "👑 Crown Jewel Standings\n" + lines.join("\n");
+  return `${title}\n` + lines.join("\n");
 }
 
 async function buildLeaderboardMessage() {
-  const sheets = getSheetsClient();
-  const range = `Leaderboard!A1:B27`;
+  return buildTwoColMessage({ title: "🏁 Leaderboard", rangeA1: RANGE_LEADERBOARD });
+}
 
-  const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
-    range,
+async function buildWinsMessage() {
+  return buildTwoColMessage({ title: "🏆 Wins", rangeA1: RANGE_WINS });
+}
+
+async function buildCrownJewelMessage() {
+  return buildTwoColMessage({
+    title: "👑 Crown Jewel Standings",
+    rangeA1: RANGE_CROWN_JEWEL,
   });
+}
 
-  const values = resp.data.values || [];
-  if (values.length < 2) return "Leaderboard is empty.";
+async function buildTop10sMessage() {
+  return buildTwoColMessage({ title: "🔟 Top 10s", rangeA1: RANGE_TOP10S });
+}
 
-  const rows = values.slice(1);
+async function buildTop5sMessage() {
+  return buildTwoColMessage({ title: "🖐️ Top 5s", rangeA1: RANGE_TOP5S });
+}
 
-  const lines = rows
-    .filter((r) => (r[0] ?? "").toString().trim() !== "")
-    .map((r, i) => {
-      const name = (r[0] ?? "").toString().trim();
-      const pts = (r[1] ?? "").toString().trim();
-      return `${String(i + 1).padStart(2, " ")}. ${name} — ${pts}`;
-    });
-
-  return "🏁 Leaderboard\n" + lines.join("\n");
+async function buildAvgFinishMessage() {
+  return buildTwoColMessage({ title: "📊 Avg Finish", rangeA1: RANGE_AVG_FINISH });
 }
 
 /**
@@ -606,11 +596,9 @@ async function handleAdminCommands(text, replyBotId) {
  * =========================
  * Shared handler for main commands (works in both groups)
  * =========================
- * - Replies using replyBotId (main bot in main group, command bot in command group)
- * - Picks: append to Import, wait for formula, respond with count
  */
 async function handleMainCommands({ msg, text, replyBotId }) {
-  const lower = (text || "").toLowerCase();
+  const lower = (text || "").toLowerCase().trim();
 
   if (lower === "help") {
     const isCommandGroup = replyBotId === COMMAND_BOT_ID;
@@ -624,22 +612,39 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  if (lower === "crown jewel") {
-    const crownMsg = await buildCrownJewelMessage();
-    await postToGroupMe(crownMsg, replyBotId);
-    return true;
-  }
-
   if (lower === "wins") {
     const winsMsg = await buildWinsMessage();
     await postToGroupMe(winsMsg, replyBotId);
     return true;
   }
 
+  if (lower === "crown jewel") {
+    const crownMsg = await buildCrownJewelMessage();
+    await postToGroupMe(crownMsg, replyBotId);
+    return true;
+  }
+
+  if (lower === "top 10s" || lower === "top10s" || lower === "top 10") {
+    const msgTxt = await buildTop10sMessage();
+    await postToGroupMe(msgTxt, replyBotId);
+    return true;
+  }
+
+  if (lower === "top 5s" || lower === "top5s" || lower === "top 5") {
+    const msgTxt = await buildTop5sMessage();
+    await postToGroupMe(msgTxt, replyBotId);
+    return true;
+  }
+
+  if (lower === "avg finish" || lower === "avgfinish" || lower === "average finish") {
+    const msgTxt = await buildAvgFinishMessage();
+    await postToGroupMe(msgTxt, replyBotId);
+    return true;
+  }
+
   // Picks
   if (!text || !text.includes("#")) return false;
 
-  // Enforce pick locking globally
   if (await isPicksLocked()) {
     await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
     return true;
@@ -648,7 +653,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
   const pickToken = (text.match(/#\d+/) || [null])[0];
   if (!pickToken) return false;
 
-  // Append to Import FIRST (so formulas can update)
   const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
   const timestampIso = msg.created_at
     ? new Date(msg.created_at * 1000).toISOString()
@@ -667,7 +671,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
 
   await appendRow(row);
 
-  // Now wait/read Driver Count after formulas recalc
   const senderName = msg.name || "";
   const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
 
@@ -699,7 +702,7 @@ app.post("/groupme", async (req, res) => {
     // Replies in each group must come from the bot that belongs to that group
     const replyBotId = isCommandGroup ? COMMAND_BOT_ID : GROUPME_BOT_ID;
 
-    // Universal help (works everywhere)
+    // Universal help
     if (text && text.toLowerCase() === "help") {
       await postToGroupMe(getHelpText(isCommandGroup), replyBotId);
       return res.sendStatus(200);
@@ -712,10 +715,7 @@ app.post("/groupme", async (req, res) => {
 
       const mainHandled = await handleMainCommands({ msg, text, replyBotId });
       if (!mainHandled && text) {
-        await postToGroupMe(
-          "Unknown command.\n\nType 'help' to see commands.",
-          replyBotId
-        );
+        await postToGroupMe("Unknown command.\n\nType 'help' to see commands.", replyBotId);
       }
       return res.sendStatus(200);
     }
