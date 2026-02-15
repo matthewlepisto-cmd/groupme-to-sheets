@@ -602,6 +602,19 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getDriverCountForPickWithRetry(senderName, pickToken, tries = 6, delayMs = 700) {
+  for (let i = 0; i < tries; i++) {
+    const count = await getDriverCountForPick(senderName, pickToken);
+    if (count !== null && count !== undefined && String(count).trim() !== "") {
+      return String(count).trim();
+    }
+    await sleep(delayMs);
+  }
+  return null;
+}
+
     // MAIN GROUP: unchanged commands
 
     if (text && text.toLowerCase() === "board update") {
@@ -631,40 +644,45 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const pickToken = (text.match(/#[^\s]+/) || [text])[0];
+// Only handle/import messages that contain #
+if (!text || !text.includes("#")) return res.sendStatus(200);
 
-    const senderName = msg.name || "";
-    const driverCount = await getDriverCountForPick(senderName, pickToken);
+// Safer: only capture "#<digits>"
+const pickToken = (text.match(/#\d+/) || [null])[0];
+if (!pickToken) return res.sendStatus(200);
 
-    if (driverCount !== null && driverCount !== undefined && driverCount !== "") {
-      await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`, replyBotId);
-    } else {
-      await postToGroupMe(`Pick Submitted, ${pickToken} - ?`, replyBotId);
-    }
+// Append to Import tab FIRST (so formulas can update)
+const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
+const timestampIso = msg.created_at
+  ? new Date(msg.created_at * 1000).toISOString()
+  : new Date().toISOString();
+const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
 
-    const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-    const timestampIso = msg.created_at
-      ? new Date(msg.created_at * 1000).toISOString()
-      : new Date().toISOString();
-    const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
+const row = [
+  timestampIso,
+  msg.group_id || "",
+  msg.sender_id || "",
+  msg.name || "",
+  text || "",
+  attachmentsJson,
+  msg.id || "",
+];
 
-    const row = [
-      timestampIso,
-      msg.group_id || "",
-      msg.sender_id || "",
-      msg.name || "",
-      text || "",
-      attachmentsJson,
-      msg.id || "",
-    ];
+await appendRow(row);
 
-    await appendRow(row);
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
-    return res.sendStatus(200);
-  }
-});
+// Now wait/read Driver Count after formulas recalc
+const senderName = msg.name || "";
+const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
+
+// Respond back to GroupMe with count (or ? if still not ready)
+if (driverCount) {
+  await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`);
+} else {
+  await postToGroupMe(`Pick Submitted, ${pickToken} - ?`);
+}
+
+return res.sendStatus(200);
+
 
 // Kick off schedule polling (and allow admin set poll to update it)
 startScheduleInterval();
@@ -674,3 +692,4 @@ runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
