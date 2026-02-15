@@ -17,11 +17,12 @@ const GROUPME_BOT_ID =
 const COMMAND_GROUP_ID = "110916855";
 const COMMAND_BOT_ID = "0cb4eb2388c240e337b026610a";
 
-
 if (!SPREADSHEET_ID || !GOOGLE_CREDS_JSON) {
   console.error("Missing env vars: SPREADSHEET_ID and/or GOOGLE_CREDS_JSON");
   process.exit(1);
 }
+
+const startedAt = Date.now();
 
 function getSheetsClient() {
   const creds = JSON.parse(GOOGLE_CREDS_JSON);
@@ -45,6 +46,92 @@ async function appendRow(row) {
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 
+/**
+ * =========================
+ * Settings helpers (Sheets)
+ * =========================
+ * Requires a tab named "Settings" with:
+ * Col A = key, Col B = value
+ * Example:
+ * LOCK_PICKS | TRUE
+ * SCHEDULE_POLL_MS | 60000
+ */
+const SETTINGS_SHEET = process.env.SETTINGS_SHEET || "Settings";
+
+async function getSetting(key) {
+  const sheets = getSheetsClient();
+  try {
+    const resp = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${SETTINGS_SHEET}!A:B`,
+    });
+
+    const rows = resp.data.values || [];
+    const k = (key ?? "").toString().trim().toUpperCase();
+
+    for (const r of rows) {
+      const kk = (r?.[0] ?? "").toString().trim().toUpperCase();
+      if (kk === k) return (r?.[1] ?? "").toString().trim();
+    }
+    return null;
+  } catch (e) {
+    // Most common cause: Settings sheet doesn't exist
+    return null;
+  }
+}
+
+async function setSetting(key, value) {
+  const sheets = getSheetsClient();
+  const k = (key ?? "").toString().trim().toUpperCase();
+  const v = (value ?? "").toString().trim();
+
+  // Read all to find existing row
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SETTINGS_SHEET}!A:B`,
+  });
+  const rows = resp.data.values || [];
+
+  let rowIndex = -1;
+  for (let i = 0; i < rows.length; i++) {
+    const kk = (rows[i]?.[0] ?? "").toString().trim().toUpperCase();
+    if (kk === k) {
+      rowIndex = i + 1; // 1-based
+      break;
+    }
+  }
+
+  if (rowIndex === -1) {
+    // append new setting
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${SETTINGS_SHEET}!A1`,
+      valueInputOption: "RAW",
+      insertDataOption: "INSERT_ROWS",
+      requestBody: { values: [[k, v]] },
+    });
+  } else {
+    // update existing setting row
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `${SETTINGS_SHEET}!A${rowIndex}:B${rowIndex}`,
+      valueInputOption: "RAW",
+      requestBody: { values: [[k, v]] },
+    });
+  }
+}
+
+async function isPicksLocked() {
+  const v = await getSetting("LOCK_PICKS");
+  if (!v) return false;
+  return ["TRUE", "YES", "1", "ON", "LOCKED"].includes(v.toString().trim().toUpperCase());
+}
+
+/**
+ * =========================
+ * Your existing functions
+ * =========================
+ */
 async function getDriverCountForPick(senderName, pickToken) {
   const sheets = getSheetsClient();
   const range = `Driver Count!A1:ZZ2000`;
@@ -167,6 +254,11 @@ async function buildLeaderboardMessage() {
   return "🏁 Leaderboard\n" + lines.join("\n");
 }
 
+/**
+ * =========================
+ * GroupMe posting
+ * =========================
+ */
 function chunkText(text, maxLen) {
   if (!text || text.length <= maxLen) return [text];
 
@@ -184,7 +276,6 @@ function chunkText(text, maxLen) {
   return chunks;
 }
 
-// ✅ UPDATED: post to a specific bot_id (main or command)
 async function postToGroupMe(text, botId = GROUPME_BOT_ID) {
   const url = "https://api.groupme.com/v3/bots/post";
 
@@ -203,8 +294,13 @@ async function postToGroupMe(text, botId = GROUPME_BOT_ID) {
   }
 }
 
+/**
+ * =========================
+ * Schedule polling
+ * =========================
+ */
 const SCHEDULE_SHEET = process.env.SCHEDULE_SHEET || "Schedule";
-const SCHEDULE_POLL_MS = Number(process.env.SCHEDULE_POLL_MS || 60_000);
+let SCHEDULE_POLL_MS = Number(process.env.SCHEDULE_POLL_MS || 60_000);
 const SCHEDULE_LOOKAHEAD_MS = Number(process.env.SCHEDULE_LOOKAHEAD_MS || 2 * 60_000);
 
 function toIso(dt) {
@@ -241,11 +337,7 @@ async function getDueScheduledMessages(now = new Date()) {
     const sendAtMs = sendAt.getTime();
 
     if (sendAtMs <= nowMs && sendAtMs >= windowStart) {
-      due.push({
-        rowIndex: i + 2,
-        message,
-        sendAt,
-      });
+      due.push({ rowIndex: i + 2, message, sendAt });
     }
   }
 
@@ -254,7 +346,6 @@ async function getDueScheduledMessages(now = new Date()) {
 
 async function markScheduledMessageSent(rowIndex, sentAt = new Date()) {
   const sheets = getSheetsClient();
-
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SCHEDULE_SHEET}!C${rowIndex}:D${rowIndex}`,
@@ -269,7 +360,7 @@ async function runScheduleTick() {
     if (!due.length) return;
 
     for (const item of due) {
-      // scheduled messages go to MAIN bot by default
+      // scheduled messages go to MAIN bot
       await postToGroupMe(item.message, GROUPME_BOT_ID);
       await markScheduledMessageSent(item.rowIndex, new Date());
     }
@@ -278,44 +369,218 @@ async function runScheduleTick() {
   }
 }
 
-// ✅ NEW: admin-only command handler (runs only in COMMAND_GROUP_ID)
+// interval control so admin can change poll ms
+let scheduleIntervalId = null;
+function startScheduleInterval() {
+  if (scheduleIntervalId) clearInterval(scheduleIntervalId);
+  scheduleIntervalId = setInterval(() => {
+    runScheduleTick();
+  }, SCHEDULE_POLL_MS);
+}
+
+/**
+ * =========================
+ * Admin actions (Sheets ops)
+ * =========================
+ */
+async function clearImportSheet() {
+  const sheets = getSheetsClient();
+  // Clears everything below the header row (row 1)
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `${SHEET_NAME}!A2:Z`,
+  });
+}
+
+async function resetCrownJewel() {
+  const sheets = getSheetsClient();
+  // Clears points column in the Crown Jewel range (keeps names)
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `Crown Jewel!B12:B37`,
+  });
+}
+
+/**
+ * =========================
+ * Admin command handler
+ * =========================
+ */
 async function handleAdminCommands(text, replyBotId) {
-  const t = (text || "").trim();
+  const raw = (text || "").trim();
+  const t = raw.toLowerCase();
 
-  if (t.toLowerCase() === "admin ping") {
-    await postToGroupMe("✅ Command bot online.", replyBotId);
+  // admin status
+  if (t === "admin status") {
+    const locked = await getSetting("LOCK_PICKS");
+    const lockedHuman =
+      locked === null ? "unknown (create Settings tab)" : (await isPicksLocked()) ? "LOCKED" : "UNLOCKED";
+
+    const persistedPoll = await getSetting("SCHEDULE_POLL_MS");
+    const upSec = Math.floor((Date.now() - startedAt) / 1000);
+
+    const msg =
+      "🛠️ Admin Status\n" +
+      `Picks: ${lockedHuman}\n` +
+      `Schedule poll: ${SCHEDULE_POLL_MS} ms` +
+      (persistedPoll ? ` (Settings: ${persistedPoll})` : "") +
+      `\nLookahead: ${SCHEDULE_LOOKAHEAD_MS} ms\n` +
+      `Uptime: ${upSec}s\n` +
+      `Now: ${new Date().toISOString()}`;
+
+    await postToGroupMe(msg, replyBotId);
     return true;
   }
 
-  if (t.toLowerCase() === "admin run schedule") {
-    await runScheduleTick();
-    await postToGroupMe("✅ Ran schedule tick.", replyBotId);
-    return true;
-  }
-
-  if (t.toLowerCase().startsWith("announce ")) {
-    const announcement = t.slice("announce ".length).trim();
-    if (announcement) {
-      await postToGroupMe(`📣 ${announcement}`, GROUPME_BOT_ID); // post to main group
-      await postToGroupMe("✅ Sent announcement to main group.", replyBotId);
-    } else {
-      await postToGroupMe("Usage: announce <message>", replyBotId);
+  // lock picks
+  if (t === "admin lock picks") {
+    try {
+      await setSetting("LOCK_PICKS", "TRUE");
+      await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
+      // optional: announce to main group
+      await postToGroupMe("🔒 Picks are now LOCKED.", GROUPME_BOT_ID);
+    } catch {
+      await postToGroupMe(
+        "❌ Could not lock picks. Make sure you created a sheet tab named 'Settings' (A=key, B=value).",
+        replyBotId
+      );
     }
     return true;
+  }
+
+  // unlock picks
+  if (t === "admin unlock picks") {
+    try {
+      await setSetting("LOCK_PICKS", "FALSE");
+      await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
+      await postToGroupMe("🔓 Picks are now UNLOCKED.", GROUPME_BOT_ID);
+    } catch {
+      await postToGroupMe(
+        "❌ Could not unlock picks. Make sure you created a sheet tab named 'Settings' (A=key, B=value).",
+        replyBotId
+      );
+    }
+    return true;
+  }
+
+  // rebuild leaderboard (posts current leaderboard to main group)
+  if (t === "admin rebuild leaderboard") {
+    const board = await buildLeaderboardMessage();
+    await postToGroupMe(board, GROUPME_BOT_ID);
+    await postToGroupMe("✅ Posted fresh leaderboard to main group.", replyBotId);
+    return true;
+  }
+
+  // clear import
+  if (t === "admin clear import") {
+    await clearImportSheet();
+    await postToGroupMe(`✅ Cleared ${SHEET_NAME} rows (kept headers).`, replyBotId);
+    return true;
+  }
+
+  // reset crown jewel
+  if (t === "admin reset crown jewel") {
+    await resetCrownJewel();
+    await postToGroupMe("✅ Reset Crown Jewel points (cleared B12:B37).", replyBotId);
+    await postToGroupMe("✅ Crown Jewel points have been reset.", GROUPME_BOT_ID);
+    return true;
+  }
+
+  // set poll (ms)
+  // example: "admin set poll 30000"
+  if (t.startsWith("admin set poll")) {
+    const parts = raw.split(/\s+/);
+    const msStr = parts[parts.length - 1];
+    const ms = Number(msStr);
+
+    if (!Number.isFinite(ms) || ms < 5_000) {
+      await postToGroupMe("Usage: admin set poll <milliseconds> (min 5000)", replyBotId);
+      return true;
+    }
+
+    SCHEDULE_POLL_MS = ms;
+    startScheduleInterval();
+
+    // persist in Settings sheet if present
+    try {
+      await setSetting("SCHEDULE_POLL_MS", String(ms));
+    } catch {
+      // ignore; still applied in memory
+    }
+
+    await postToGroupMe(`✅ Schedule poll set to ${ms} ms.`, replyBotId);
+    return true;
+  }
+
+  /**
+   * Updated announce:
+   * - announce <msg> (defaults to main)
+   * - announce main <msg>
+   * - announce command <msg>
+   * - announce both <msg>
+   */
+  if (t.startsWith("announce ")) {
+    const rest = raw.slice("announce ".length).trim();
+    if (!rest) {
+      await postToGroupMe(
+        "Usage:\nannounce <msg>\nannounce main <msg>\nannounce command <msg>\nannounce both <msg>",
+        replyBotId
+      );
+      return true;
+    }
+
+    const lowerRest = rest.toLowerCase();
+    const targets = ["main", "command", "both"];
+    const firstWord = lowerRest.split(/\s+/)[0];
+
+    let mode = "main";
+    let msg = rest;
+
+    if (targets.includes(firstWord)) {
+      mode = firstWord;
+      msg = rest.slice(firstWord.length).trim();
+    }
+
+    if (!msg) {
+      await postToGroupMe("Usage: announce (main|command|both) <message>", replyBotId);
+      return true;
+    }
+
+    const final = `📣 ${msg}`;
+
+    if (mode === "main") {
+      await postToGroupMe(final, GROUPME_BOT_ID);
+      await postToGroupMe("✅ Announced to main group.", replyBotId);
+      return true;
+    }
+
+    if (mode === "command") {
+      await postToGroupMe(final, COMMAND_BOT_ID);
+      return true;
+    }
+
+    if (mode === "both") {
+      await postToGroupMe(final, GROUPME_BOT_ID);
+      await postToGroupMe(final, COMMAND_BOT_ID);
+      await postToGroupMe("✅ Announced to BOTH groups.", replyBotId);
+      return true;
+    }
   }
 
   return false;
 }
 
+/**
+ * =========================
+ * Webhook
+ * =========================
+ */
 app.post("/groupme", async (req, res) => {
   const msg = req.body;
 
   try {
     if (!msg) return res.sendStatus(200);
-
-    // Ignore bot messages to prevent loops
     if (msg.sender_type === "bot") return res.sendStatus(200);
-    // NOTE: sender_id is NOT bot_id; sender_type is the right loop guard.
 
     const text = msg.text?.trim() || "";
     const groupId = (msg.group_id ?? "").toString();
@@ -323,19 +588,21 @@ app.post("/groupme", async (req, res) => {
     const isCommandGroup = groupId === COMMAND_GROUP_ID;
     const replyBotId = isCommandGroup ? COMMAND_BOT_ID : GROUPME_BOT_ID;
 
-    // ✅ Command group => admin-only commands
+    // COMMAND GROUP: admin-only
     if (isCommandGroup) {
       const handled = await handleAdminCommands(text, replyBotId);
       if (!handled && text) {
         await postToGroupMe(
-          "Unknown admin command.\nTry: admin ping | admin run schedule | announce <message>",
+          "Unknown admin command.\nCommands:\n" +
+            "admin lock picks\nadmin unlock picks\nadmin rebuild leaderboard\nadmin clear import\nadmin reset crown jewel\nadmin set poll 30000\nadmin status\n" +
+            "announce <msg> | announce main <msg> | announce command <msg> | announce both <msg>",
           replyBotId
         );
       }
       return res.sendStatus(200);
     }
 
-    // MAIN group behavior unchanged from here down
+    // MAIN GROUP: unchanged commands
 
     if (text && text.toLowerCase() === "board update") {
       const board = await buildLeaderboardMessage();
@@ -355,7 +622,14 @@ app.post("/groupme", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // only handle/import messages that contain #
     if (!text || !text.includes("#")) return res.sendStatus(200);
+
+    // 🔒 Enforce pick locking (admin controls via Settings sheet)
+    if (await isPicksLocked()) {
+      await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
+      return res.sendStatus(200);
+    }
 
     const pickToken = (text.match(/#[^\s]+/) || [text])[0];
 
@@ -392,14 +666,11 @@ app.post("/groupme", async (req, res) => {
   }
 });
 
-// Kick off schedule polling
-setInterval(() => {
-  runScheduleTick();
-}, SCHEDULE_POLL_MS);
+// Kick off schedule polling (and allow admin set poll to update it)
+startScheduleInterval();
 
 // Optional: run once at startup
 runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
-
