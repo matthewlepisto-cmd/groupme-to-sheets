@@ -10,7 +10,8 @@ const SHEET_NAME = process.env.SHEET_NAME || "Import";
 const GOOGLE_CREDS_JSON = process.env.GOOGLE_CREDS_JSON;
 
 // MAIN bot (posts to main group)
-const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID || "08d51442da9b9a749a7e6bd04d";
+const GROUPME_BOT_ID =
+  process.env.GROUPME_BOT_ID || "08d51442da9b9a749a7e6bd04d";
 
 // COMMAND bot (admin group only)
 const COMMAND_GROUP_ID = "110916855";
@@ -44,6 +45,50 @@ async function appendRow(row) {
 }
 
 app.get("/", (req, res) => res.status(200).send("OK"));
+
+/**
+ * =========================
+ * Help text
+ * =========================
+ */
+function getHelpText(isCommandGroup) {
+  if (isCommandGroup) {
+    return (
+      "🤖 Command Bot Help\n\n" +
+      "Admin commands:\n" +
+      "• admin help\n" +
+      "• admin status\n" +
+      "• admin lock picks\n" +
+      "• admin unlock picks\n" +
+      "• admin rebuild leaderboard\n" +
+      "• admin clear import\n" +
+      "• admin reset crown jewel\n" +
+      "• admin set poll 30000\n\n" +
+      "Announce:\n" +
+      "• announce <msg>\n" +
+      "• announce main <msg>\n" +
+      "• announce command <msg>\n" +
+      "• announce both <msg>\n\n" +
+      "Main commands (also work here):\n" +
+      "• help\n" +
+      "• board update\n" +
+      "• wins\n" +
+      "• crown jewel\n" +
+      "• #<number> (example: #2)"
+    );
+  }
+
+  return (
+    "🏁 Bot Help\n\n" +
+    "Commands:\n" +
+    "• help\n" +
+    "• board update\n" +
+    "• wins\n" +
+    "• crown jewel\n" +
+    "• #<number> (example: #2)\n\n" +
+    "Note: Admin commands are only available in the command group."
+  );
+}
 
 /**
  * =========================
@@ -114,7 +159,9 @@ async function setSetting(key, value) {
 async function isPicksLocked() {
   const v = await getSetting("LOCK_PICKS");
   if (!v) return false;
-  return ["TRUE", "YES", "1", "ON", "LOCKED"].includes(v.toString().trim().toUpperCase());
+  return ["TRUE", "YES", "1", "ON", "LOCKED"].includes(
+    v.toString().trim().toUpperCase()
+  );
 }
 
 /**
@@ -171,12 +218,15 @@ async function getDriverCountForPick(senderName, pickToken) {
   return null;
 }
 
-/**
- * Step-2 helper: retry for formula recalculation
- */
+// Retry helper for formula recalculation
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function getDriverCountForPickWithRetry(senderName, pickToken, tries = 6, delayMs = 700) {
+async function getDriverCountForPickWithRetry(
+  senderName,
+  pickToken,
+  tries = 6,
+  delayMs = 700
+) {
   for (let i = 0; i < tries; i++) {
     const count = await getDriverCountForPick(senderName, pickToken);
     if (count !== null && count !== undefined && String(count).trim() !== "") {
@@ -287,10 +337,10 @@ function chunkText(text, maxLen) {
   return chunks;
 }
 
-async function postToGroupMe(text, botId = GROUPME_BOT_ID) {
+async function postToGroupMe(text, botId) {
   const url = "https://api.groupme.com/v3/bots/post";
-
   const chunks = chunkText(text, 900);
+
   for (const chunk of chunks) {
     const res = await fetch(url, {
       method: "POST",
@@ -312,7 +362,9 @@ async function postToGroupMe(text, botId = GROUPME_BOT_ID) {
  */
 const SCHEDULE_SHEET = process.env.SCHEDULE_SHEET || "Schedule";
 let SCHEDULE_POLL_MS = Number(process.env.SCHEDULE_POLL_MS || 60_000);
-const SCHEDULE_LOOKAHEAD_MS = Number(process.env.SCHEDULE_LOOKAHEAD_MS || 2 * 60_000);
+const SCHEDULE_LOOKAHEAD_MS = Number(
+  process.env.SCHEDULE_LOOKAHEAD_MS || 2 * 60_000
+);
 
 function toIso(dt) {
   return dt ? new Date(dt).toISOString() : new Date().toISOString();
@@ -371,6 +423,7 @@ async function runScheduleTick() {
     if (!due.length) return;
 
     for (const item of due) {
+      // Scheduled messages always go to MAIN group (main bot)
       await postToGroupMe(item.message, GROUPME_BOT_ID);
       await markScheduledMessageSent(item.rowIndex, new Date());
     }
@@ -411,6 +464,11 @@ async function resetCrownJewel() {
 async function handleAdminCommands(text, replyBotId) {
   const raw = (text || "").trim();
   const t = raw.toLowerCase();
+
+  if (t === "admin help") {
+    await postToGroupMe(getHelpText(true), replyBotId);
+    return true;
+  }
 
   if (t === "admin status") {
     const locked = await getSetting("LOCK_PICKS");
@@ -546,6 +604,84 @@ async function handleAdminCommands(text, replyBotId) {
 
 /**
  * =========================
+ * Shared handler for main commands (works in both groups)
+ * =========================
+ * - Replies using replyBotId (main bot in main group, command bot in command group)
+ * - Picks: append to Import, wait for formula, respond with count
+ */
+async function handleMainCommands({ msg, text, replyBotId }) {
+  const lower = (text || "").toLowerCase();
+
+  if (lower === "help") {
+    const isCommandGroup = replyBotId === COMMAND_BOT_ID;
+    await postToGroupMe(getHelpText(isCommandGroup), replyBotId);
+    return true;
+  }
+
+  if (lower === "board update") {
+    const board = await buildLeaderboardMessage();
+    await postToGroupMe(board, replyBotId);
+    return true;
+  }
+
+  if (lower === "crown jewel") {
+    const crownMsg = await buildCrownJewelMessage();
+    await postToGroupMe(crownMsg, replyBotId);
+    return true;
+  }
+
+  if (lower === "wins") {
+    const winsMsg = await buildWinsMessage();
+    await postToGroupMe(winsMsg, replyBotId);
+    return true;
+  }
+
+  // Picks
+  if (!text || !text.includes("#")) return false;
+
+  // Enforce pick locking globally
+  if (await isPicksLocked()) {
+    await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
+    return true;
+  }
+
+  const pickToken = (text.match(/#\d+/) || [null])[0];
+  if (!pickToken) return false;
+
+  // Append to Import FIRST (so formulas can update)
+  const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
+  const timestampIso = msg.created_at
+    ? new Date(msg.created_at * 1000).toISOString()
+    : new Date().toISOString();
+  const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
+
+  const row = [
+    timestampIso,
+    msg.group_id || "",
+    msg.sender_id || "",
+    msg.name || "",
+    text || "",
+    attachmentsJson,
+    msg.id || "",
+  ];
+
+  await appendRow(row);
+
+  // Now wait/read Driver Count after formulas recalc
+  const senderName = msg.name || "";
+  const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
+
+  if (driverCount) {
+    await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`, replyBotId);
+  } else {
+    await postToGroupMe(`Pick Submitted, ${pickToken} - ?`, replyBotId);
+  }
+
+  return true;
+}
+
+/**
+ * =========================
  * Webhook
  * =========================
  */
@@ -558,86 +694,34 @@ app.post("/groupme", async (req, res) => {
 
     const text = msg.text?.trim() || "";
     const groupId = (msg.group_id ?? "").toString();
-
     const isCommandGroup = groupId === COMMAND_GROUP_ID;
+
+    // Replies in each group must come from the bot that belongs to that group
     const replyBotId = isCommandGroup ? COMMAND_BOT_ID : GROUPME_BOT_ID;
 
-    // COMMAND GROUP: admin-only
+    // Universal help (works everywhere)
+    if (text && text.toLowerCase() === "help") {
+      await postToGroupMe(getHelpText(isCommandGroup), replyBotId);
+      return res.sendStatus(200);
+    }
+
+    // Command group: admin commands first, then allow main commands too
     if (isCommandGroup) {
-      const handled = await handleAdminCommands(text, replyBotId);
-      if (!handled && text) {
+      const adminHandled = await handleAdminCommands(text, replyBotId);
+      if (adminHandled) return res.sendStatus(200);
+
+      const mainHandled = await handleMainCommands({ msg, text, replyBotId });
+      if (!mainHandled && text) {
         await postToGroupMe(
-          "Unknown admin command.\nCommands:\n" +
-            "admin lock picks\nadmin unlock picks\nadmin rebuild leaderboard\nadmin clear import\nadmin reset crown jewel\nadmin set poll 30000\nadmin status\n" +
-            "announce <msg> | announce main <msg> | announce command <msg> | announce both <msg>",
+          "Unknown command.\n\nType 'help' to see commands.",
           replyBotId
         );
       }
       return res.sendStatus(200);
     }
 
-    // MAIN GROUP: fixed order for formula-based counts
-
-    if (text && text.toLowerCase() === "board update") {
-      const board = await buildLeaderboardMessage();
-      await postToGroupMe(board, replyBotId);
-      return res.sendStatus(200);
-    }
-
-    if (text && text.toLowerCase() === "crown jewel") {
-      const crownMsg = await buildCrownJewelMessage();
-      await postToGroupMe(crownMsg, replyBotId);
-      return res.sendStatus(200);
-    }
-
-    if (text && text.toLowerCase() === "wins") {
-      const winsMsg = await buildWinsMessage();
-      await postToGroupMe(winsMsg, replyBotId);
-      return res.sendStatus(200);
-    }
-
-    // only handle/import messages that contain #
-    if (!text || !text.includes("#")) return res.sendStatus(200);
-
-    // Enforce pick locking
-    if (await isPicksLocked()) {
-      await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
-      return res.sendStatus(200);
-    }
-
-    // Safer pick token: "#<digits>"
-    const pickToken = (text.match(/#\d+/) || [null])[0];
-    if (!pickToken) return res.sendStatus(200);
-
-    // Append to Import FIRST (so formulas can update)
-    const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-    const timestampIso = msg.created_at
-      ? new Date(msg.created_at * 1000).toISOString()
-      : new Date().toISOString();
-    const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
-
-    const row = [
-      timestampIso,
-      msg.group_id || "",
-      msg.sender_id || "",
-      msg.name || "",
-      text || "",
-      attachmentsJson,
-      msg.id || "",
-    ];
-
-    await appendRow(row);
-
-    // Now wait/read Driver Count after formulas recalc
-    const senderName = msg.name || "";
-    const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
-
-    if (driverCount) {
-      await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`, replyBotId);
-    } else {
-      await postToGroupMe(`Pick Submitted, ${pickToken} - ?`, replyBotId);
-    }
-
+    // Main group: main commands only
+    await handleMainCommands({ msg, text, replyBotId });
     return res.sendStatus(200);
   } catch (err) {
     console.error("Webhook error:", err);
@@ -645,12 +729,9 @@ app.post("/groupme", async (req, res) => {
   }
 });
 
-// Kick off schedule polling (and allow admin set poll to update it)
+// Kick off schedule polling (always posts to MAIN bot)
 startScheduleInterval();
-
-// Optional: run once at startup
 runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
-
