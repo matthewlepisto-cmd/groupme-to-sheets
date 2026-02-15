@@ -70,13 +70,14 @@ function getHelpText(isCommandGroup) {
     "• top 10s\n" +
     "• top 5s\n" +
     "• avg finish\n" +
+    "• picks, <index>   (example: picks, 1)\n" +
     "• #<number> (example: #2)\n";
 
   if (isCommandGroup) {
     return (
       "🤖 Command Bot Help\n\n" +
-      "• run_results\n" +
       "Admin commands:\n" +
+      "• run_results\n" +
       "• admin help\n" +
       "• admin status\n" +
       "• admin lock picks\n" +
@@ -85,11 +86,14 @@ function getHelpText(isCommandGroup) {
       "• admin clear import\n" +
       "• admin reset crown jewel\n" +
       "• admin set poll 30000\n\n" +
-      "Announce:\n" +
-      "• announce <msg>\n" +
-      "• announce main <msg>\n" +
-      "• announce command <msg>\n" +
-      "• announce both <msg>\n\n" +
+      "Announce-to-main (run here, posts in MAIN group):\n" +
+      "• announce wins\n" +
+      "• announce board update\n" +
+      "• announce crown jewel\n" +
+      "• announce top 10s\n" +
+      "• announce top 5s\n" +
+      "• announce avg finish\n" +
+      "• announce picks, <index>\n\n" +
       "Main commands (also work here):\n" +
       common
     );
@@ -98,7 +102,7 @@ function getHelpText(isCommandGroup) {
   return (
     "🏁 Bot Help\n\n" +
     common +
-    "\nNote: Admin commands are only available in the command group."
+    "\nNote: Admin/announce commands are only available in the command group."
   );
 }
 
@@ -281,28 +285,77 @@ async function buildTwoColMessage({ title, rangeA1 }) {
 async function buildLeaderboardMessage() {
   return buildTwoColMessage({ title: "🏁 Leaderboard", rangeA1: RANGE_LEADERBOARD });
 }
-
 async function buildWinsMessage() {
   return buildTwoColMessage({ title: "🏆 Wins", rangeA1: RANGE_WINS });
 }
-
 async function buildCrownJewelMessage() {
-  return buildTwoColMessage({
-    title: "👑 Crown Jewel Standings",
-    rangeA1: RANGE_CROWN_JEWEL,
-  });
+  return buildTwoColMessage({ title: "👑 Crown Jewel Standings", rangeA1: RANGE_CROWN_JEWEL });
 }
-
 async function buildTop10sMessage() {
   return buildTwoColMessage({ title: "🔟 Top 10s", rangeA1: RANGE_TOP10S });
 }
-
 async function buildTop5sMessage() {
   return buildTwoColMessage({ title: "🖐️ Top 5s", rangeA1: RANGE_TOP5S });
 }
-
 async function buildAvgFinishMessage() {
   return buildTwoColMessage({ title: "📊 Avg Finish", rangeA1: RANGE_AVG_FINISH });
+}
+
+/**
+ * =========================
+ * Picks, Index (BOT Picks)
+ * =========================
+ * Command: "picks, 1"
+ * - Lists names from A2:A30
+ * - Finds the column where row 2 equals the index
+ * - Outputs "Name — value" for that column
+ */
+async function buildPicksIndexMessage(indexRaw) {
+  const idx = (indexRaw ?? "").toString().trim();
+  if (!idx) return "Usage: picks, <index>   (example: picks, 1)";
+
+  const sheets = getSheetsClient();
+
+  // Pull a wide block so we can find the matching header in row 2 and read values for rows 2-30.
+  const range = `BOT Picks!A1:ZZ30`;
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
+  const values = resp.data.values || [];
+  if (values.length < 3) return "BOT Picks tab does not have enough rows.";
+
+  // Row 2 (1-based) is index 1 (0-based)
+  const headerRow = values[1] || [];
+
+  // Find first column where headerRow[col] == idx (string compare)
+  let targetCol = -1;
+  for (let c = 0; c < headerRow.length; c++) {
+    const v = (headerRow[c] ?? "").toString().trim();
+    if (v === idx) {
+      targetCol = c;
+      break;
+    }
+  }
+
+  if (targetCol === -1) {
+    return `No column found in BOT Picks where row 2 equals "${idx}".`;
+  }
+
+  // Rows 2..30 (1-based) => indices 1..29 (0-based)
+  const lines = [];
+  for (let r = 1; r <= 29 && r < values.length; r++) {
+    const row = values[r] || [];
+    const name = (row[0] ?? "").toString().trim(); // column A
+    if (!name || name.toLowerCase() === "name") continue;
+
+    const val = (row[targetCol] ?? "").toString().trim();
+    lines.push(`${String(lines.length + 1).padStart(2, " ")}. ${name} — ${val}`);
+  }
+
+  if (!lines.length) return `Picks, ${idx}\n(no rows found in A2:A30)`;
+  return `🧾 Picks, ${idx}\n` + lines.join("\n");
 }
 
 /**
@@ -451,15 +504,81 @@ async function resetCrownJewel() {
   });
 }
 
+/**
+ * =========================
+ * Admin command handler
+ * =========================
+ * NOTE: Runs ONLY in command group.
+ * "announce <stat>" commands post the OUTPUT to the MAIN group.
+ */
 async function handleAdminCommands(text, replyBotId) {
   const raw = (text || "").trim();
-  const t = raw.toLowerCase();
+  const t = raw.toLowerCase().trim();
 
+  // admin help
   if (t === "admin help") {
     await postToGroupMe(getHelpText(true), replyBotId);
     return true;
   }
 
+  /**
+   * Announce-to-main shortcuts (command group only)
+   * - announce wins
+   * - announce board update
+   * - announce crown jewel
+   * - announce top 10s
+   * - announce top 5s
+   * - announce avg finish
+   * - announce picks, <index>
+   */
+  if (t.startsWith("announce")) {
+    // normalize "announce something"
+    const rest = raw.slice("announce".length).trim();
+    const restLower = rest.toLowerCase().trim();
+
+    // announce picks, <index>
+    const mPicks = restLower.match(/^picks\s*,\s*(.+)$/i);
+    if (mPicks) {
+      const idx = (mPicks[1] ?? "").toString().trim();
+      const msgTxt = await buildPicksIndexMessage(idx);
+      await postToGroupMe(msgTxt, GROUPME_BOT_ID); // post to MAIN
+      await postToGroupMe(`✅ Announced Picks, ${idx} to the MAIN group.`, replyBotId);
+      return true;
+    }
+
+    let msgTxt = null;
+    if (restLower === "wins") msgTxt = await buildWinsMessage();
+    else if (restLower === "board update" || restLower === "leaderboard")
+      msgTxt = await buildLeaderboardMessage();
+    else if (restLower === "crown jewel") msgTxt = await buildCrownJewelMessage();
+    else if (restLower === "top 10s" || restLower === "top10s" || restLower === "top 10")
+      msgTxt = await buildTop10sMessage();
+    else if (restLower === "top 5s" || restLower === "top5s" || restLower === "top 5")
+      msgTxt = await buildTop5sMessage();
+    else if (
+      restLower === "avg finish" ||
+      restLower === "avgfinish" ||
+      restLower === "average finish"
+    )
+      msgTxt = await buildAvgFinishMessage();
+
+    if (msgTxt) {
+      await postToGroupMe(msgTxt, GROUPME_BOT_ID); // post to MAIN
+      await postToGroupMe("✅ Announced to the MAIN group.", replyBotId);
+      return true;
+    }
+
+    // If they typed "announce ..." but not one of the supported announce commands:
+    await postToGroupMe(
+      "Unknown announce command.\n" +
+        "Use:\n" +
+        "announce wins\nannounce board update\nannounce crown jewel\nannounce top 10s\nannounce top 5s\nannounce avg finish\nannounce picks, <index>",
+      replyBotId
+    );
+    return true;
+  }
+
+  // admin status
   if (t === "admin status") {
     const locked = await getSetting("LOCK_PICKS");
     const lockedHuman =
@@ -485,6 +604,7 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
+  // lock picks
   if (t === "admin lock picks") {
     await setSetting("LOCK_PICKS", "TRUE");
     await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
@@ -492,6 +612,7 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
+  // unlock picks
   if (t === "admin unlock picks") {
     await setSetting("LOCK_PICKS", "FALSE");
     await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
@@ -499,6 +620,7 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
+  // rebuild leaderboard (posts current leaderboard to main group)
   if (t === "admin rebuild leaderboard") {
     const board = await buildLeaderboardMessage();
     await postToGroupMe(board, GROUPME_BOT_ID);
@@ -506,12 +628,14 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
+  // clear import
   if (t === "admin clear import") {
     await clearImportSheet();
     await postToGroupMe(`✅ Cleared ${SHEET_NAME} rows (kept headers).`, replyBotId);
     return true;
   }
 
+  // reset crown jewel (kept as-is; you can point it to 2026 LeaderBoard if desired later)
   if (t === "admin reset crown jewel") {
     await resetCrownJewel();
     await postToGroupMe("✅ Reset Crown Jewel points (cleared B12:B37).", replyBotId);
@@ -519,6 +643,8 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
+  // set poll (ms)
+  // example: "admin set poll 30000"
   if (t.startsWith("admin set poll")) {
     const parts = raw.split(/\s+/);
     const msStr = parts[parts.length - 1];
@@ -532,61 +658,15 @@ async function handleAdminCommands(text, replyBotId) {
     SCHEDULE_POLL_MS = ms;
     startScheduleInterval();
 
+    // persist in Settings sheet if present
     try {
       await setSetting("SCHEDULE_POLL_MS", String(ms));
     } catch {
-      // ignore
+      // ignore; still applied in memory
     }
 
     await postToGroupMe(`✅ Schedule poll set to ${ms} ms.`, replyBotId);
     return true;
-  }
-
-  // announce / announce main / announce command / announce both
-  if (t.startsWith("announce ")) {
-    const rest = raw.slice("announce ".length).trim();
-    if (!rest) {
-      await postToGroupMe(
-        "Usage:\nannounce <msg>\nannounce main <msg>\nannounce command <msg>\nannounce both <msg>",
-        replyBotId
-      );
-      return true;
-    }
-
-    const lowerRest = rest.toLowerCase();
-    const targets = ["main", "command", "both"];
-    const firstWord = lowerRest.split(/\s+/)[0];
-
-    let mode = "main";
-    let msg = rest;
-
-    if (targets.includes(firstWord)) {
-      mode = firstWord;
-      msg = rest.slice(firstWord.length).trim();
-    }
-
-    if (!msg) {
-      await postToGroupMe("Usage: announce (main|command|both) <message>", replyBotId);
-      return true;
-    }
-
-    const final = `📣 ${msg}`;
-
-    if (mode === "main") {
-      await postToGroupMe(final, GROUPME_BOT_ID);
-      await postToGroupMe("✅ Announced to main group.", replyBotId);
-      return true;
-    }
-    if (mode === "command") {
-      await postToGroupMe(final, COMMAND_BOT_ID);
-      return true;
-    }
-    if (mode === "both") {
-      await postToGroupMe(final, GROUPME_BOT_ID);
-      await postToGroupMe(final, COMMAND_BOT_ID);
-      await postToGroupMe("✅ Announced to BOTH groups.", replyBotId);
-      return true;
-    }
   }
 
   return false;
@@ -596,9 +676,12 @@ async function handleAdminCommands(text, replyBotId) {
  * =========================
  * Shared handler for main commands (works in both groups)
  * =========================
+ * - Replies using replyBotId (main bot in main group, command bot in command group)
+ * - Picks: append to Import, wait for formula, respond with count
  */
 async function handleMainCommands({ msg, text, replyBotId }) {
-  const lower = (text || "").toLowerCase().trim();
+  const raw = (text || "").trim();
+  const lower = raw.toLowerCase().trim();
 
   if (lower === "help") {
     const isCommandGroup = replyBotId === COMMAND_BOT_ID;
@@ -642,17 +725,28 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // Picks
-  if (!text || !text.includes("#")) return false;
+  // Picks, Index
+  // Accepts: "picks, 1" / "Picks,1" / "picks ,  1"
+  const mPicks = raw.match(/^picks\s*,\s*(.+)$/i);
+  if (mPicks) {
+    const idx = (mPicks[1] ?? "").toString().trim();
+    const msgTxt = await buildPicksIndexMessage(idx);
+    await postToGroupMe(msgTxt, replyBotId);
+    return true;
+  }
+
+  // Picks submission
+  if (!raw.includes("#")) return false;
 
   if (await isPicksLocked()) {
     await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
     return true;
   }
 
-  const pickToken = (text.match(/#\d+/) || [null])[0];
+  const pickToken = (raw.match(/#\d+/) || [null])[0];
   if (!pickToken) return false;
 
+  // Append to Import FIRST (so formulas can update)
   const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
   const timestampIso = msg.created_at
     ? new Date(msg.created_at * 1000).toISOString()
@@ -664,13 +758,14 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     msg.group_id || "",
     msg.sender_id || "",
     msg.name || "",
-    text || "",
+    raw || "",
     attachmentsJson,
     msg.id || "",
   ];
 
   await appendRow(row);
 
+  // Now wait/read Driver Count after formulas recalc
   const senderName = msg.name || "";
   const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
 
