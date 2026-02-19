@@ -66,7 +66,9 @@ app.get("/", (req, res) => res.status(200).send("OK"));
  */
 async function triggerRaces2026Import() {
   if (!APPS_SCRIPT_WEBAPP_URL || !APPS_SCRIPT_SECRET) {
-    throw new Error("Missing APPS_SCRIPT_WEBAPP_URL or APPS_SCRIPT_SECRET in Render env vars");
+    throw new Error(
+      "Missing APPS_SCRIPT_WEBAPP_URL or APPS_SCRIPT_SECRET in Render env vars"
+    );
   }
 
   const res = await fetch(APPS_SCRIPT_WEBAPP_URL, {
@@ -118,7 +120,8 @@ function getHelpText(isCommandGroup) {
       "• admin rebuild leaderboard\n" +
       "• admin clear import\n" +
       "• admin reset crown jewel\n" +
-      "• admin set poll 30000\n\n" +
+      "• admin set poll 30000\n" +
+      '• admin setpick <name|sender_name> #<number>   (example: admin setpick Emily #4)\n\n' +
       "Announce (generic):\n" +
       "• announce <msg>\n" +
       "• announce main <msg>\n" +
@@ -216,6 +219,52 @@ async function isPicksLocked() {
   return ["TRUE", "YES", "1", "ON", "LOCKED"].includes(
     v.toString().trim().toUpperCase()
   );
+}
+
+/**
+ * =========================
+ * BOT Picks resolver
+ * BOT Picks columns:
+ * A = sender_id
+ * B = name
+ * C = sender_name
+ *
+ * Admin setpick uses either name OR sender_name (NOT sender_id)
+ * =========================
+ */
+async function resolveUserFromBotPicksByNameOrSenderName(identifier) {
+  const idRaw = (identifier ?? "").toString().trim();
+  if (!idRaw) return null;
+
+  const sheets = getSheetsClient();
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `BOT Picks!A2:C`,
+  });
+
+  const rows = resp.data.values || [];
+  const norm = (v) => (v ?? "").toString().trim();
+  const normLower = (v) => norm(v).toLowerCase();
+
+  const needle = normLower(idRaw);
+
+  for (const r of rows) {
+    const senderId = norm(r?.[0]);
+    const name = norm(r?.[1]);
+    const senderName = norm(r?.[2]);
+
+    if (!senderId && !name && !senderName) continue;
+
+    if (normLower(name) === needle || normLower(senderName) === needle) {
+      return {
+        sender_id: senderId,
+        name,
+        sender_name: senderName,
+      };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -389,14 +438,15 @@ async function buildPicksIndexMessage(indexRaw) {
   const lines = [];
   for (let r = 1; r <= 29 && r < values.length; r++) {
     const row = values[r] || [];
-    const name = (row[0] ?? "").toString().trim();
+    // With new BOT Picks layout, "name" is now in column B (index 1)
+    const name = (row[1] ?? "").toString().trim();
     if (!name || name.toLowerCase() === "name") continue;
 
     const val = (row[targetCol] ?? "").toString().trim();
     lines.push(`${String(lines.length + 1).padStart(2, " ")}. ${name} — ${val}`);
   }
 
-  if (!lines.length) return `🧾 Picks, ${colLabel}\n(no rows found in A2:A30)`;
+  if (!lines.length) return `🧾 Picks, ${colLabel}\n(no rows found in BOT Picks)`;
   return `🧾 Picks, ${colLabel}\n` + lines.join("\n");
 }
 
@@ -550,7 +600,7 @@ async function resetCrownJewel() {
  * Admin command handler
  * =========================
  */
-async function handleAdminCommands(text, replyBotId) {
+async function handleAdminCommands({ msg, text, replyBotId }) {
   const raw = (text || "").trim();
   const t = raw.toLowerCase().trim();
 
@@ -559,12 +609,83 @@ async function handleAdminCommands(text, replyBotId) {
     return true;
   }
 
-  // ✅ NEW: Trigger Apps Script import (Races 2026)
+  /**
+   * ✅ NEW: admin setpick <name|sender_name> #<number>
+   * - Finds user from BOT Picks (A=sender_id, B=name, C=sender_name)
+   * - Appends a pick row into Import as if they submitted it
+   * - Triggers your existing driverCount logic and only posts at 3 or 4
+   */
+  const mSetPick = raw.match(/^admin\s+setpick\s+(".*?"|.+?)\s+(#\d+)\s*$/i);
+  if (mSetPick) {
+    const whoRaw = (mSetPick[1] ?? "").toString().trim();
+    const who = whoRaw.replace(/^"(.*)"$/, "$1").trim();
+    const pickToken = (mSetPick[2] ?? "").toString().trim(); // "#4"
+
+    const resolved = await resolveUserFromBotPicksByNameOrSenderName(who);
+    if (!resolved) {
+      await postToGroupMe(
+        `❌ Can't find "${who}" in BOT Picks columns B (name) or C (sender_name).\n` +
+          `Usage: admin setpick <name|sender_name> #<number>\n` +
+          `Example: admin setpick Emily #4`,
+        replyBotId
+      );
+      return true;
+    }
+
+    // IMPORTANT:
+    // Your driver count lookup uses the "senderName" that matches row1 headers in Driver Count.
+    // In normal flow you pass msg.name, which is effectively sender_name.
+    const spoofSenderId = resolved.sender_id || "";
+    const spoofSenderName = resolved.sender_name || resolved.name || who;
+
+    const timestampIso = new Date().toISOString();
+
+    // Append to Import sheet as if THEY submitted "#4"
+    await appendRow([
+      timestampIso,
+      msg.group_id || "",
+      spoofSenderId,
+      spoofSenderName,
+      pickToken,
+      "",
+      `admin-setpick-${Date.now()}`,
+    ]);
+
+    const driverCount = await getDriverCountForPickWithRetry(
+      spoofSenderName,
+      pickToken,
+      6,
+      700
+    );
+
+    if (driverCount === "3") {
+      await postToGroupMe(
+        `Final ${pickToken} pick for ${spoofSenderName}`,
+        GROUPME_BOT_ID
+      );
+    } else if (driverCount === "4") {
+      await postToGroupMe(
+        `Exceeded 3 driver pick limit, ${spoofSenderName} please submit new pick`,
+        replyBotId
+      );
+    }
+
+    await postToGroupMe(
+      `✅ Admin set ${spoofSenderName} to ${pickToken}. (count: ${driverCount ?? "?"})`,
+      replyBotId
+    );
+    return true;
+  }
+
+  // ✅ Trigger Apps Script import (Races 2026)
   if (t === "admin results") {
     try {
       await postToGroupMe("⏳ Triggering Races 2026 import…", replyBotId);
       const respTxt = await triggerRaces2026Import();
-      await postToGroupMe(`✅ Import triggered. (Apps Script: ${String(respTxt).trim() || "ok"})`, replyBotId);
+      await postToGroupMe(
+        `✅ Import triggered. (Apps Script: ${String(respTxt).trim() || "ok"})`,
+        replyBotId
+      );
     } catch (e) {
       await postToGroupMe(`❌ Failed to trigger import: ${e?.message || e}`, replyBotId);
     }
@@ -665,7 +786,7 @@ async function handleAdminCommands(text, replyBotId) {
     const persistedPoll = await getSetting("SCHEDULE_POLL_MS");
     const upSec = Math.floor((Date.now() - startedAt) / 1000);
 
-    const msg =
+    const msgTxt =
       "🛠️ Admin Status\n" +
       `Picks: ${lockedHuman}\n` +
       `Schedule poll: ${SCHEDULE_POLL_MS} ms` +
@@ -674,7 +795,7 @@ async function handleAdminCommands(text, replyBotId) {
       `Uptime: ${upSec}s\n` +
       `Now: ${new Date().toISOString()}`;
 
-    await postToGroupMe(msg, replyBotId);
+    await postToGroupMe(msgTxt, replyBotId);
     return true;
   }
 
@@ -828,12 +949,17 @@ async function handleMainCommands({ msg, text, replyBotId }) {
   const senderName = msg.name || "";
   const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
 
-  if (driverCount) {
-    await postToGroupMe(`Pick Submitted, ${pickToken} - ${driverCount}`, replyBotId);
-  } else {
-    await postToGroupMe(`Pick Submitted, ${pickToken} - ?`, replyBotId);
+  // Only post at 3 or 4
+  if (driverCount === "3") {
+    await postToGroupMe(`Final ${pickToken} pick for ${senderName}`, GROUPME_BOT_ID);
+  } else if (driverCount === "4") {
+    await postToGroupMe(
+      `Exceeded 3 driver pick limit, ${senderName} please submit new pick`,
+      replyBotId
+    );
   }
 
+  // Do nothing for 1 or 2
   return true;
 }
 
@@ -861,7 +987,7 @@ app.post("/groupme", async (req, res) => {
     }
 
     if (isCommandGroup) {
-      const adminHandled = await handleAdminCommands(text, replyBotId);
+      const adminHandled = await handleAdminCommands({ msg, text, replyBotId });
       if (adminHandled) return res.sendStatus(200);
 
       const mainHandled = await handleMainCommands({ msg, text, replyBotId });
