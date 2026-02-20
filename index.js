@@ -22,8 +22,9 @@ const APPS_SCRIPT_WEBAPP_URL = process.env.APPS_SCRIPT_WEBAPP_URL; // https://sc
 const APPS_SCRIPT_SECRET = process.env.APPS_SCRIPT_SECRET; // "run results 2026 - Dale"
 
 // 2026 Schedule tab (for race index lookups)
+// Expected layout: B = Index, C = Race Date
 const SCHEDULE_2026_TAB = "2026 Schedule";
-const RANGE_SCHEDULE_2026 = `${SCHEDULE_2026_TAB}!B2:C`; // B=index, C=race date
+const RANGE_SCHEDULE_2026 = `${SCHEDULE_2026_TAB}!B2:C`;
 
 // 2026 LeaderBoard tab ranges
 const LEADERBOARD_2026_TAB = "2026 LeaderBoard";
@@ -49,7 +50,6 @@ const startedAt = Date.now();
 
 // Returns: "YYYY-MM-DDTHH:mm:ss" in America/Chicago (Sheets-friendly)
 function toChicagoLocal(dateObj = new Date()) {
-  // sv-SE gives ISO-like format: "YYYY-MM-DD HH:mm:ss"
   const s = new Intl.DateTimeFormat("sv-SE", {
     timeZone: "America/Chicago",
     year: "numeric",
@@ -164,7 +164,10 @@ function getHelpText(isCommandGroup) {
       "• admin clear import\n" +
       "• admin reset crown jewel\n" +
       "• admin set poll 30000\n" +
-      '• admin setpick <name|sender_name> <#number|No Pick>   (example: admin setpick Emily #4)\n\n' +
+      '• admin setpick <name|sender_name> <#number|No Pick>, <raceIndex>\n' +
+      '    examples: admin setpick Tyler #4, 1 | admin setpick Tyler No Pick, 1\n' +
+      '• admin setpick <name|sender_name> clear, <raceIndex>\n' +
+      '    example: admin setpick Tyler clear, 1\n\n' +
       "Announce (generic):\n" +
       "• announce <msg>\n" +
       "• announce main <msg>\n" +
@@ -312,10 +315,12 @@ async function resolveUserFromBotPicksByNameOrSenderName(identifier) {
 
 /**
  * =========================
- * Get current race index (next race date >= today, Chicago)
+ * Schedule helpers
  * =========================
  */
-async function getCurrentRaceIndex2026() {
+
+// Build sorted schedule list: [{idx, date}]
+async function getScheduleIndexToDateMap2026() {
   const sheets = getSheetsClient();
   const resp = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -323,45 +328,91 @@ async function getCurrentRaceIndex2026() {
   });
 
   const rows = resp.data.values || [];
-  if (!rows.length) return null;
+  const out = [];
 
-  const today = chicagoTodayDateOnly();
+  for (const r of rows) {
+    const idx = (r?.[0] ?? "").toString().trim();
+    const dateRaw = r?.[1];
+    if (!idx || !dateRaw) continue;
 
-  // rows: [index, raceDate]
-  const parsed = rows
-    .map((r) => {
-      const idx = (r?.[0] ?? "").toString().trim();
-      const dateRaw = r?.[1];
-      const d = dateRaw ? new Date(dateRaw) : null;
-      return { idx, d };
-    })
-    .filter((x) => x.idx && x.d && !isNaN(x.d.getTime()))
-    .sort((a, b) => a.d.getTime() - b.d.getTime());
+    const d = new Date(dateRaw);
+    if (isNaN(d.getTime())) continue;
 
-  if (!parsed.length) return null;
-
-  // Find first race date >= today
-  for (const item of parsed) {
-    const d0 = new Date(item.d);
-    d0.setHours(0, 0, 0, 0);
-    if (d0.getTime() >= today.getTime()) return item.idx;
+    d.setHours(0, 0, 0, 0);
+    out.push({ idx: String(idx), date: d });
   }
 
-  // After last race: return last index (or null if you prefer)
-  return parsed[parsed.length - 1].idx;
+  out.sort((a, b) => a.date.getTime() - b.date.getTime());
+  return out;
+}
+
+// Current race index = first race date >= today (Chicago)
+async function getCurrentRaceIndex2026() {
+  const schedule = await getScheduleIndexToDateMap2026();
+  if (!schedule.length) return null;
+
+  const today = chicagoTodayDateOnly();
+  for (const item of schedule) {
+    if (item.date.getTime() >= today.getTime()) return item.idx;
+  }
+  return schedule[schedule.length - 1].idx;
+}
+
+/**
+ * Spoof a Chicago-local timestamp that will map to the given race index under
+ * "next race date >= pick date" logic.
+ *
+ * For index 1: pickDate <= raceDate(1)
+ * For index n>1: (raceDate(n-1), raceDate(n)] maps to n
+ */
+async function spoofTimestampForRaceIndex2026(targetIndex) {
+  const target = String(targetIndex ?? "").trim();
+  if (!target) return null;
+
+  const schedule = await getScheduleIndexToDateMap2026();
+  if (!schedule.length) return null;
+
+  const pos = schedule.findIndex((x) => x.idx === target);
+  if (pos === -1) return null;
+
+  const targetDate = new Date(schedule[pos].date); // date-only
+  let spoof;
+
+  if (pos === 0) {
+    // For race 1, choose noon on race date (safe)
+    spoof = new Date(targetDate);
+    spoof.setHours(12, 0, 0, 0);
+  } else {
+    const prevDate = new Date(schedule[pos - 1].date);
+    // Choose a time strictly after prevDate but still <= targetDate
+    spoof = new Date(prevDate);
+    spoof.setHours(12, 0, 0, 0);
+    spoof = new Date(spoof.getTime() + 24 * 60 * 60 * 1000); // next day noon
+
+    // If that pushes past target date (rare edge case), clamp to target date noon
+    if (spoof.getTime() > targetDate.getTime()) {
+      spoof = new Date(targetDate);
+      spoof.setHours(12, 0, 0, 0);
+    }
+  }
+
+  return toChicagoLocal(spoof);
 }
 
 /**
  * =========================
  * Auto-fill No Pick on lock
- * - Uses BOT Picks row2 to locate the column for current race index
- * - If user's cell for that index is blank -> append "No Pick" to Import
+ * - Looks at BOT Picks row 2 to find the column for the current race index
+ * - For any player with blank in that column, append "No Pick" to Import
  * =========================
  */
 async function autoFillNoPicksForCurrentRace(replyBotId) {
   const raceIdx = await getCurrentRaceIndex2026();
   if (!raceIdx) {
-    await postToGroupMe("⚠️ Could not determine current race index (check 2026 Schedule B:C).", replyBotId);
+    await postToGroupMe(
+      "⚠️ Could not determine current race index (check 2026 Schedule B:C).",
+      replyBotId
+    );
     return;
   }
 
@@ -373,7 +424,10 @@ async function autoFillNoPicksForCurrentRace(replyBotId) {
 
   const values = resp.data.values || [];
   if (values.length < 3) {
-    await postToGroupMe("⚠️ BOT Picks tab does not have enough rows (need row2 with index numbers).", replyBotId);
+    await postToGroupMe(
+      "⚠️ BOT Picks tab does not have enough rows (need row2 with index numbers).",
+      replyBotId
+    );
     return;
   }
 
@@ -401,22 +455,21 @@ async function autoFillNoPicksForCurrentRace(replyBotId) {
   // Start at row index 2 (sheet row 3) where user list typically begins
   for (let r = 2; r < values.length; r++) {
     const row = values[r] || [];
-    const senderId = norm(row[0]);      // A
-    const name = norm(row[1]);          // B
-    const senderName = norm(row[2]);    // C
+    const senderId = norm(row[0]); // A
+    const name = norm(row[1]); // B
+    const senderName = norm(row[2]); // C
 
     if (!senderId && !name && !senderName) continue;
 
     const existingPick = norm(row[targetCol]);
     if (existingPick) continue; // already has something (skip)
 
-    // Spoof "No Pick"
     const timestampIso = nowChicago();
     const spoofSenderName = senderName || name || "Unknown";
 
     await appendRow([
       timestampIso,
-      COMMAND_GROUP_ID,           // group id marker (admin/system)
+      COMMAND_GROUP_ID,
       senderId || "",
       spoofSenderName,
       "No Pick",
@@ -775,14 +828,17 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
   }
 
   /**
-   * ✅ admin setpick <name|sender_name> <#number|No Pick>
+   * ✅ NEW:
+   * admin setpick <name|sender_name> <#number|No Pick>, <raceIndex>
+   * admin setpick <name|sender_name> clear, <raceIndex>
+   *
    * Examples:
-   * admin setpick Emily #4
-   * admin setpick Emily No Pick
-   * admin setpick "Emily Smith" "No Pick"
+   * admin setpick Tyler No Pick, 1
+   * admin setpick Tyler #4, 1
+   * admin setpick Tyler clear, 1
    */
   const mSetPick = raw.match(
-    /^admin\s+setpick\s+(".*?"|.+?)\s+("no\s*pick"|no\s*pick|#\d+|"#\d+")\s*$/i
+    /^admin\s+setpick\s+(".*?"|.+?)\s+(.+?)\s*,\s*(\d+)\s*$/i
   );
   if (mSetPick) {
     const whoRaw = (mSetPick[1] ?? "").toString().trim();
@@ -791,12 +847,26 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
     let pickRaw = (mSetPick[2] ?? "").toString().trim();
     pickRaw = pickRaw.replace(/^"(.*)"$/, "$1").trim();
 
-    const isNoPick = /^no\s*pick$/i.test(pickRaw);
-    const pickToken = isNoPick ? "No Pick" : (pickRaw.match(/#\d+/) || [null])[0];
+    const raceIndex = (mSetPick[3] ?? "").toString().trim();
 
-    if (!pickToken) {
+    const isClear = /^clear$/i.test(pickRaw);
+    const isNoPick = /^no\s*pick$/i.test(pickRaw);
+
+    const pickToken = isClear
+      ? "clear"
+      : isNoPick
+      ? "No Pick"
+      : (pickRaw.match(/#\d+/) || [null])[0];
+
+    if (!raceIndex || (!pickToken && !isClear)) {
       await postToGroupMe(
-        `Usage: admin setpick <name|sender_name> <#number|No Pick>\nExample: admin setpick Emily #4`,
+        `Usage:\n` +
+          `admin setpick <name|sender_name> <#number|No Pick>, <raceIndex>\n` +
+          `admin setpick <name|sender_name> clear, <raceIndex>\n\n` +
+          `Examples:\n` +
+          `• admin setpick Tyler #4, 1\n` +
+          `• admin setpick Tyler No Pick, 1\n` +
+          `• admin setpick Tyler clear, 1`,
         replyBotId
       );
       return true;
@@ -806,8 +876,7 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
     if (!resolved) {
       await postToGroupMe(
         `❌ Can't find "${who}" in BOT Picks columns B (name) or C (sender_name).\n` +
-          `Usage: admin setpick <name|sender_name> <#number|No Pick>\n` +
-          `Example: admin setpick Emily #4`,
+          `Usage: admin setpick <name|sender_name> <#number|No Pick|clear>, <raceIndex>`,
         replyBotId
       );
       return true;
@@ -816,20 +885,31 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
     const spoofSenderId = resolved.sender_id || "";
     const spoofSenderName = resolved.sender_name || resolved.name || who;
 
-    const timestampIso = nowChicago();
+    // Spoof timestamp that maps to the requested race index
+    const timestampIso = await spoofTimestampForRaceIndex2026(raceIndex);
+    if (!timestampIso) {
+      await postToGroupMe(
+        `❌ Could not spoof timestamp for race index ${raceIndex}. Check ${SCHEDULE_2026_TAB} columns B (Index) and C (Race Date).`,
+        replyBotId
+      );
+      return true;
+    }
+
+    // For "clear", write something that your regex formulas won't treat as a pick
+    const rawTextForImport = isClear ? "clear" : pickToken;
 
     await appendRow([
       timestampIso,
       msg.group_id || "",
       spoofSenderId,
       spoofSenderName,
-      pickToken,
+      rawTextForImport,
       "",
-      `admin-setpick-${Date.now()}`,
+      `admin-setpick-${raceIndex}-${Date.now()}`,
     ]);
 
-    // Only run driver count logic for real # picks (No Pick shouldn't count)
-    if (!isNoPick) {
+    // Only run driver-count announcements for real # picks
+    if (!isNoPick && !isClear) {
       const driverCount = await getDriverCountForPickWithRetry(
         spoofSenderName,
         pickToken,
@@ -850,13 +930,24 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
       }
 
       await postToGroupMe(
-        `✅ Admin set ${spoofSenderName} to ${pickToken}. (count: ${driverCount ?? "?"})`,
+        `✅ Admin set ${spoofSenderName} to ${pickToken} for Race Index ${raceIndex}. (count: ${driverCount ?? "?"})`,
         replyBotId
       );
       return true;
     }
 
-    await postToGroupMe(`✅ Admin set ${spoofSenderName} to No Pick.`, replyBotId);
+    if (isClear) {
+      await postToGroupMe(
+        `✅ Cleared ${spoofSenderName}'s pick for Race Index ${raceIndex}.`,
+        replyBotId
+      );
+      return true;
+    }
+
+    await postToGroupMe(
+      `✅ Admin set ${spoofSenderName} to No Pick for Race Index ${raceIndex}.`,
+      replyBotId
+    );
     return true;
   }
 
@@ -866,7 +957,6 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
     await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
     await postToGroupMe("🔒 Picks are now LOCKED.", GROUPME_BOT_ID);
 
-    // Auto-fill missing picks with No Pick for the current race index
     await postToGroupMe("🧾 Checking for missing picks…", replyBotId);
     await autoFillNoPicksForCurrentRace(replyBotId);
 
@@ -880,7 +970,6 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // ✅ Trigger Apps Script import (Races 2026)
   if (t === "admin results") {
     try {
       await postToGroupMe("⏳ Triggering Races 2026 import…", replyBotId);
@@ -895,7 +984,6 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  // ✅ Announce (generic + announce-to-main outputs)
   if (t.startsWith("announce")) {
     const rest = raw.slice("announce".length).trim();
     const restLower = rest.toLowerCase().trim();
@@ -1110,7 +1198,6 @@ async function handleMainCommands({ msg, text, replyBotId }) {
   // ✅ CHANGED: accept # picks OR "No Pick"
   const isNoPick = /^no\s*pick$/i.test(raw);
   const pickToken = isNoPick ? "No Pick" : (raw.match(/#\d+/) || [null])[0];
-
   if (!pickToken) return false;
 
   if (await isPicksLocked()) {
@@ -1120,7 +1207,7 @@ async function handleMainCommands({ msg, text, replyBotId }) {
 
   const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
 
-  // ✅ Chicago-local timestamp for Import sheet
+  // Chicago-local timestamp for Import sheet
   const createdAt = msg.created_at ? new Date(msg.created_at * 1000) : new Date();
   const timestampIso = toChicagoLocal(createdAt);
 
@@ -1141,7 +1228,12 @@ async function handleMainCommands({ msg, text, replyBotId }) {
   // Only do driver-count announcements for real # picks
   if (!isNoPick) {
     const senderName = msg.name || "";
-    const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
+    const driverCount = await getDriverCountForPickWithRetry(
+      senderName,
+      pickToken,
+      6,
+      700
+    );
 
     if (driverCount === "3") {
       await postToGroupMe(`Final ${pickToken} pick for ${senderName}`, GROUPME_BOT_ID);
