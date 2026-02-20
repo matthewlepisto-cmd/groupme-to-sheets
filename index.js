@@ -148,8 +148,7 @@ function getHelpText(isCommandGroup) {
     "• top 5s\n" +
     "• avg finish\n" +
     "• picks, <index>   (example: picks, 1)\n" +
-    "• #<number> (example: #2)\n" +
-    "• No Pick (example: No Pick)\n";
+    "• #<number> (example: #2)\n";
 
   if (isCommandGroup) {
     return (
@@ -160,10 +159,6 @@ function getHelpText(isCommandGroup) {
       "• admin results   (triggers Apps Script import to Races 2026)\n" +
       "• admin lock picks   (also auto-fills No Pick for missing picks)\n" +
       "• admin unlock picks\n" +
-      "• admin rebuild leaderboard\n" +
-      "• admin clear import\n" +
-      "• admin reset crown jewel\n" +
-      "• admin set poll 30000\n" +
       '• admin setpick <name|sender_name> <#number|No Pick>, <raceIndex>\n' +
       '    examples: admin setpick Tyler #4, 1 | admin setpick Tyler No Pick, 1\n' +
       '• admin setpick <name|sender_name> clear, <raceIndex>\n' +
@@ -1296,3 +1291,4 @@ runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
