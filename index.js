@@ -1166,15 +1166,14 @@ app.post("/groupme", async (req, res) => {
     }
 
     if (isCommandGroup) {
-      const adminHandled = await handleAdminCommands({ msg, text, replyBotId });
-      if (adminHandled) return res.sendStatus(200);
+  const adminHandled = await handleAdminCommands({ msg, text, replyBotId });
+  if (adminHandled) return res.sendStatus(200);
 
-      const mainHandled = await handleMainCommands({ msg, text, replyBotId });
-      if (!mainHandled && text) {
-        await postToGroupMe("Unknown command.\n\nType 'help' to see commands.", replyBotId);
-      }
-      return res.sendStatus(200);
-    }
+  const mainHandled = await handleMainCommands({ msg, text, replyBotId });
+
+  // ✅ No unknown-command reply
+  return res.sendStatus(200);
+}
 
     await handleMainCommands({ msg, text, replyBotId });
     return res.sendStatus(200);
@@ -1190,3 +1189,4 @@ runScheduleTick().catch(() => {});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on ${port}`));
+
