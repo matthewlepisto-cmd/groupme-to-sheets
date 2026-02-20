@@ -21,6 +21,10 @@ const COMMAND_BOT_ID = "0cb4eb2388c240e337b026610a";
 const APPS_SCRIPT_WEBAPP_URL = process.env.APPS_SCRIPT_WEBAPP_URL; // https://script.google.com/macros/s/.../exec
 const APPS_SCRIPT_SECRET = process.env.APPS_SCRIPT_SECRET; // "run results 2026 - Dale"
 
+// 2026 Schedule tab (for race index lookups)
+const SCHEDULE_2026_TAB = "2026 Schedule";
+const RANGE_SCHEDULE_2026 = `${SCHEDULE_2026_TAB}!B2:C`; // B=index, C=race date
+
 // 2026 LeaderBoard tab ranges
 const LEADERBOARD_2026_TAB = "2026 LeaderBoard";
 const RANGE_LEADERBOARD = `${LEADERBOARD_2026_TAB}!I1:J27`;
@@ -36,6 +40,44 @@ if (!SPREADSHEET_ID || !GOOGLE_CREDS_JSON) {
 }
 
 const startedAt = Date.now();
+
+/**
+ * =========================
+ * Time helpers (America/Chicago)
+ * =========================
+ */
+
+// Returns: "YYYY-MM-DDTHH:mm:ss" in America/Chicago (Sheets-friendly)
+function toChicagoLocal(dateObj = new Date()) {
+  // sv-SE gives ISO-like format: "YYYY-MM-DD HH:mm:ss"
+  const s = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(dateObj);
+
+  return s.replace(" ", "T");
+}
+
+function nowChicago() {
+  return toChicagoLocal(new Date());
+}
+
+// Date-only (00:00:00) in Chicago for correct “today” comparisons
+function chicagoTodayDateOnly() {
+  const s = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date()); // "YYYY-MM-DD"
+  return new Date(`${s}T00:00:00`);
+}
 
 function getSheetsClient() {
   const creds = JSON.parse(GOOGLE_CREDS_JSON);
@@ -106,7 +148,8 @@ function getHelpText(isCommandGroup) {
     "• top 5s\n" +
     "• avg finish\n" +
     "• picks, <index>   (example: picks, 1)\n" +
-    "• #<number> (example: #2)\n";
+    "• #<number> (example: #2)\n" +
+    "• No Pick (example: No Pick)\n";
 
   if (isCommandGroup) {
     return (
@@ -115,13 +158,13 @@ function getHelpText(isCommandGroup) {
       "• admin help\n" +
       "• admin status\n" +
       "• admin results   (triggers Apps Script import to Races 2026)\n" +
-      "• admin lock picks\n" +
+      "• admin lock picks   (also auto-fills No Pick for missing picks)\n" +
       "• admin unlock picks\n" +
       "• admin rebuild leaderboard\n" +
       "• admin clear import\n" +
       "• admin reset crown jewel\n" +
       "• admin set poll 30000\n" +
-      '• admin setpick <name|sender_name> #<number>   (example: admin setpick Emily #4)\n\n' +
+      '• admin setpick <name|sender_name> <#number|No Pick>   (example: admin setpick Emily #4)\n\n' +
       "Announce (generic):\n" +
       "• announce <msg>\n" +
       "• announce main <msg>\n" +
@@ -265,6 +308,129 @@ async function resolveUserFromBotPicksByNameOrSenderName(identifier) {
   }
 
   return null;
+}
+
+/**
+ * =========================
+ * Get current race index (next race date >= today, Chicago)
+ * =========================
+ */
+async function getCurrentRaceIndex2026() {
+  const sheets = getSheetsClient();
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: RANGE_SCHEDULE_2026,
+  });
+
+  const rows = resp.data.values || [];
+  if (!rows.length) return null;
+
+  const today = chicagoTodayDateOnly();
+
+  // rows: [index, raceDate]
+  const parsed = rows
+    .map((r) => {
+      const idx = (r?.[0] ?? "").toString().trim();
+      const dateRaw = r?.[1];
+      const d = dateRaw ? new Date(dateRaw) : null;
+      return { idx, d };
+    })
+    .filter((x) => x.idx && x.d && !isNaN(x.d.getTime()))
+    .sort((a, b) => a.d.getTime() - b.d.getTime());
+
+  if (!parsed.length) return null;
+
+  // Find first race date >= today
+  for (const item of parsed) {
+    const d0 = new Date(item.d);
+    d0.setHours(0, 0, 0, 0);
+    if (d0.getTime() >= today.getTime()) return item.idx;
+  }
+
+  // After last race: return last index (or null if you prefer)
+  return parsed[parsed.length - 1].idx;
+}
+
+/**
+ * =========================
+ * Auto-fill No Pick on lock
+ * - Uses BOT Picks row2 to locate the column for current race index
+ * - If user's cell for that index is blank -> append "No Pick" to Import
+ * =========================
+ */
+async function autoFillNoPicksForCurrentRace(replyBotId) {
+  const raceIdx = await getCurrentRaceIndex2026();
+  if (!raceIdx) {
+    await postToGroupMe("⚠️ Could not determine current race index (check 2026 Schedule B:C).", replyBotId);
+    return;
+  }
+
+  const sheets = getSheetsClient();
+  const resp = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `BOT Picks!A1:ZZ200`,
+  });
+
+  const values = resp.data.values || [];
+  if (values.length < 3) {
+    await postToGroupMe("⚠️ BOT Picks tab does not have enough rows (need row2 with index numbers).", replyBotId);
+    return;
+  }
+
+  const row2 = values[1] || []; // index row
+  const norm = (v) => (v ?? "").toString().trim();
+
+  let targetCol = -1;
+  for (let c = 0; c < row2.length; c++) {
+    if (norm(row2[c]) === String(raceIdx)) {
+      targetCol = c;
+      break;
+    }
+  }
+
+  if (targetCol === -1) {
+    await postToGroupMe(
+      `⚠️ Couldn't find a BOT Picks column where row 2 equals "${raceIdx}".`,
+      replyBotId
+    );
+    return;
+  }
+
+  let appended = 0;
+
+  // Start at row index 2 (sheet row 3) where user list typically begins
+  for (let r = 2; r < values.length; r++) {
+    const row = values[r] || [];
+    const senderId = norm(row[0]);      // A
+    const name = norm(row[1]);          // B
+    const senderName = norm(row[2]);    // C
+
+    if (!senderId && !name && !senderName) continue;
+
+    const existingPick = norm(row[targetCol]);
+    if (existingPick) continue; // already has something (skip)
+
+    // Spoof "No Pick"
+    const timestampIso = nowChicago();
+    const spoofSenderName = senderName || name || "Unknown";
+
+    await appendRow([
+      timestampIso,
+      COMMAND_GROUP_ID,           // group id marker (admin/system)
+      senderId || "",
+      spoofSenderName,
+      "No Pick",
+      "",
+      `auto-nopick-${raceIdx}-${senderId || spoofSenderName}-${Date.now()}`,
+    ]);
+
+    appended++;
+  }
+
+  await postToGroupMe(
+    `✅ Auto-filled "No Pick" for Race Index ${raceIdx}: ${appended} missing picks.`,
+    replyBotId
+  );
 }
 
 /**
@@ -436,10 +602,9 @@ async function buildPicksIndexMessage(indexRaw) {
   const colLabel = (row1[targetCol] ?? "").toString().trim() || idx;
 
   const lines = [];
-  for (let r = 1; r <= 29 && r < values.length; r++) {
+  for (let r = 2; r <= 29 && r < values.length; r++) {
     const row = values[r] || [];
-    // With new BOT Picks layout, "name" is now in column B (index 1)
-    const name = (row[1] ?? "").toString().trim();
+    const name = (row[1] ?? "").toString().trim(); // col B
     if (!name || name.toLowerCase() === "name") continue;
 
     const val = (row[targetCol] ?? "").toString().trim();
@@ -502,7 +667,7 @@ const SCHEDULE_LOOKAHEAD_MS = Number(
 );
 
 function toIso(dt) {
-  return dt ? new Date(dt).toISOString() : new Date().toISOString();
+  return toChicagoLocal(dt ? new Date(dt) : new Date());
 }
 
 async function getDueScheduledMessages(now = new Date()) {
@@ -610,37 +775,49 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
   }
 
   /**
-   * ✅ NEW: admin setpick <name|sender_name> #<number>
-   * - Finds user from BOT Picks (A=sender_id, B=name, C=sender_name)
-   * - Appends a pick row into Import as if they submitted it
-   * - Triggers your existing driverCount logic and only posts at 3 or 4
+   * ✅ admin setpick <name|sender_name> <#number|No Pick>
+   * Examples:
+   * admin setpick Emily #4
+   * admin setpick Emily No Pick
+   * admin setpick "Emily Smith" "No Pick"
    */
-  const mSetPick = raw.match(/^admin\s+setpick\s+(".*?"|.+?)\s+(#\d+)\s*$/i);
+  const mSetPick = raw.match(
+    /^admin\s+setpick\s+(".*?"|.+?)\s+("no\s*pick"|no\s*pick|#\d+|"#\d+")\s*$/i
+  );
   if (mSetPick) {
     const whoRaw = (mSetPick[1] ?? "").toString().trim();
     const who = whoRaw.replace(/^"(.*)"$/, "$1").trim();
-    const pickToken = (mSetPick[2] ?? "").toString().trim(); // "#4"
+
+    let pickRaw = (mSetPick[2] ?? "").toString().trim();
+    pickRaw = pickRaw.replace(/^"(.*)"$/, "$1").trim();
+
+    const isNoPick = /^no\s*pick$/i.test(pickRaw);
+    const pickToken = isNoPick ? "No Pick" : (pickRaw.match(/#\d+/) || [null])[0];
+
+    if (!pickToken) {
+      await postToGroupMe(
+        `Usage: admin setpick <name|sender_name> <#number|No Pick>\nExample: admin setpick Emily #4`,
+        replyBotId
+      );
+      return true;
+    }
 
     const resolved = await resolveUserFromBotPicksByNameOrSenderName(who);
     if (!resolved) {
       await postToGroupMe(
         `❌ Can't find "${who}" in BOT Picks columns B (name) or C (sender_name).\n` +
-          `Usage: admin setpick <name|sender_name> #<number>\n` +
+          `Usage: admin setpick <name|sender_name> <#number|No Pick>\n` +
           `Example: admin setpick Emily #4`,
         replyBotId
       );
       return true;
     }
 
-    // IMPORTANT:
-    // Your driver count lookup uses the "senderName" that matches row1 headers in Driver Count.
-    // In normal flow you pass msg.name, which is effectively sender_name.
     const spoofSenderId = resolved.sender_id || "";
     const spoofSenderName = resolved.sender_name || resolved.name || who;
 
-    const timestampIso = new Date().toISOString();
+    const timestampIso = nowChicago();
 
-    // Append to Import sheet as if THEY submitted "#4"
     await appendRow([
       timestampIso,
       msg.group_id || "",
@@ -651,29 +828,55 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
       `admin-setpick-${Date.now()}`,
     ]);
 
-    const driverCount = await getDriverCountForPickWithRetry(
-      spoofSenderName,
-      pickToken,
-      6,
-      700
-    );
-
-    if (driverCount === "3") {
-      await postToGroupMe(
-        `Final ${pickToken} pick for ${spoofSenderName}`,
-        GROUPME_BOT_ID
+    // Only run driver count logic for real # picks (No Pick shouldn't count)
+    if (!isNoPick) {
+      const driverCount = await getDriverCountForPickWithRetry(
+        spoofSenderName,
+        pickToken,
+        6,
+        700
       );
-    } else if (driverCount === "4") {
+
+      if (driverCount === "3") {
+        await postToGroupMe(
+          `Final ${pickToken} pick for ${spoofSenderName}`,
+          GROUPME_BOT_ID
+        );
+      } else if (driverCount === "4") {
+        await postToGroupMe(
+          `Exceeded 3 driver pick limit, ${spoofSenderName} please submit new pick`,
+          replyBotId
+        );
+      }
+
       await postToGroupMe(
-        `Exceeded 3 driver pick limit, ${spoofSenderName} please submit new pick`,
+        `✅ Admin set ${spoofSenderName} to ${pickToken}. (count: ${driverCount ?? "?"})`,
         replyBotId
       );
+      return true;
     }
 
-    await postToGroupMe(
-      `✅ Admin set ${spoofSenderName} to ${pickToken}. (count: ${driverCount ?? "?"})`,
-      replyBotId
-    );
+    await postToGroupMe(`✅ Admin set ${spoofSenderName} to No Pick.`, replyBotId);
+    return true;
+  }
+
+  // ✅ NEW: lock picks triggers No Pick autofill
+  if (t === "admin lock picks") {
+    await setSetting("LOCK_PICKS", "TRUE");
+    await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
+    await postToGroupMe("🔒 Picks are now LOCKED.", GROUPME_BOT_ID);
+
+    // Auto-fill missing picks with No Pick for the current race index
+    await postToGroupMe("🧾 Checking for missing picks…", replyBotId);
+    await autoFillNoPicksForCurrentRace(replyBotId);
+
+    return true;
+  }
+
+  if (t === "admin unlock picks") {
+    await setSetting("LOCK_PICKS", "FALSE");
+    await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
+    await postToGroupMe("🔓 Picks are now UNLOCKED.", GROUPME_BOT_ID);
     return true;
   }
 
@@ -793,23 +996,9 @@ async function handleAdminCommands({ msg, text, replyBotId }) {
       (persistedPoll ? ` (Settings: ${persistedPoll})` : "") +
       `\nLookahead: ${SCHEDULE_LOOKAHEAD_MS} ms\n` +
       `Uptime: ${upSec}s\n` +
-      `Now: ${new Date().toISOString()}`;
+      `Now: ${nowChicago()}`;
 
     await postToGroupMe(msgTxt, replyBotId);
-    return true;
-  }
-
-  if (t === "admin lock picks") {
-    await setSetting("LOCK_PICKS", "TRUE");
-    await postToGroupMe("🔒 Picks are now LOCKED.", replyBotId);
-    await postToGroupMe("🔒 Picks are now LOCKED.", GROUPME_BOT_ID);
-    return true;
-  }
-
-  if (t === "admin unlock picks") {
-    await setSetting("LOCK_PICKS", "FALSE");
-    await postToGroupMe("🔓 Picks are now UNLOCKED.", replyBotId);
-    await postToGroupMe("🔓 Picks are now UNLOCKED.", GROUPME_BOT_ID);
     return true;
   }
 
@@ -918,20 +1107,23 @@ async function handleMainCommands({ msg, text, replyBotId }) {
     return true;
   }
 
-  if (!raw.includes("#")) return false;
+  // ✅ CHANGED: accept # picks OR "No Pick"
+  const isNoPick = /^no\s*pick$/i.test(raw);
+  const pickToken = isNoPick ? "No Pick" : (raw.match(/#\d+/) || [null])[0];
+
+  if (!pickToken) return false;
 
   if (await isPicksLocked()) {
     await postToGroupMe("🔒 Picks are locked right now. No submissions accepted.", replyBotId);
     return true;
   }
 
-  const pickToken = (raw.match(/#\d+/) || [null])[0];
-  if (!pickToken) return false;
-
   const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-  const timestampIso = msg.created_at
-    ? new Date(msg.created_at * 1000).toISOString()
-    : new Date().toISOString();
+
+  // ✅ Chicago-local timestamp for Import sheet
+  const createdAt = msg.created_at ? new Date(msg.created_at * 1000) : new Date();
+  const timestampIso = toChicagoLocal(createdAt);
+
   const attachmentsJson = hasAttachments ? JSON.stringify(msg.attachments) : "";
 
   const row = [
@@ -946,20 +1138,21 @@ async function handleMainCommands({ msg, text, replyBotId }) {
 
   await appendRow(row);
 
-  const senderName = msg.name || "";
-  const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
+  // Only do driver-count announcements for real # picks
+  if (!isNoPick) {
+    const senderName = msg.name || "";
+    const driverCount = await getDriverCountForPickWithRetry(senderName, pickToken, 6, 700);
 
-  // Only post at 3 or 4
-  if (driverCount === "3") {
-    await postToGroupMe(`Final ${pickToken} pick for ${senderName}`, GROUPME_BOT_ID);
-  } else if (driverCount === "4") {
-    await postToGroupMe(
-      `Exceeded 3 driver pick limit, ${senderName} please submit new pick`,
-      replyBotId
-    );
+    if (driverCount === "3") {
+      await postToGroupMe(`Final ${pickToken} pick for ${senderName}`, GROUPME_BOT_ID);
+    } else if (driverCount === "4") {
+      await postToGroupMe(
+        `Exceeded 3 driver pick limit, ${senderName} please submit new pick`,
+        replyBotId
+      );
+    }
   }
 
-  // Do nothing for 1 or 2
   return true;
 }
 
